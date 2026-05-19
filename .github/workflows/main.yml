@@ -13,6 +13,7 @@ jobs:
         with:
           ruby-version: 3.4
           bundler-cache: true
+          cache-version: 1
       - name: Run rubocop
         run: |
           bundle exec rubocop --parallel
@@ -20,6 +21,7 @@ jobs:
   tests:
     name: Tests
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -28,12 +30,17 @@ jobs:
         - 3.2
         - 3.3
         - 3.4
+        - 4.0
         database: [ mysql, postgres, sqlite ]
-        gemfile: [ rails_7_1, rails_7_2, rails_8_0, rails_main ]
+        gemfile: [ rails_7_1, rails_7_2, rails_8_0, rails_8_1, rails_main ]
         exclude:
           - ruby-version: "3.1"
             gemfile: rails_8_0
           - ruby-version: "3.1"
+            gemfile: rails_8_1
+          - ruby-version: "3.1"
+            gemfile: rails_main
+          - ruby-version: "3.2"
             gemfile: rails_main
     services:
       mysql:
@@ -61,6 +68,7 @@ jobs:
         with:
           ruby-version: ${{ matrix.ruby-version }}
           bundler-cache: true
+          cache-version: 1
       - name: Update to latest Rails
         run: |
           bundle update railties
@@ -77,4 +85,4 @@ jobs:
           path: |
             test/dummy/log/test.log
           if-no-files-found: ignore
-          retention-days: 7
+          retention-days: 30

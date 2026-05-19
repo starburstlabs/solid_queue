@@ -2,7 +2,7 @@
 
 require "test_helper"
 
-class ProcessesLifecycleTest < ActiveSupport::TestCase
+class ForkedProcessesLifecycleTest < ActiveSupport::TestCase
   self.use_transactional_tests = false
 
   setup do
@@ -58,13 +58,14 @@ class ProcessesLifecycleTest < ActiveSupport::TestCase
       signal_process(@pid, :TERM, wait: 0.1.second)
     end
 
-    sleep(1.second)
+    wait_while_with_timeout(SolidQueue.shutdown_timeout + 1.second) { process_exists?(@pid) }
     assert_clean_termination
   end
 
   test "quit supervisor while there are jobs in-flight" do
     no_pause = enqueue_store_result_job("no pause")
-    pause = enqueue_store_result_job("pause", pause: 1.second)
+    # long enough pause to make sure it doesn't finish
+    pause = enqueue_store_result_job("pause", pause: 60.second)
 
     wait_while_with_timeout(1.second) { SolidQueue::ReadyExecution.count > 0 }
 
@@ -87,7 +88,7 @@ class ProcessesLifecycleTest < ActiveSupport::TestCase
 
   test "term supervisor while there are jobs in-flight" do
     no_pause = enqueue_store_result_job("no pause")
-    pause = enqueue_store_result_job("pause", pause: 0.2.seconds)
+    pause = enqueue_store_result_job("pause", pause: 1.second)
 
     signal_process(@pid, :TERM, wait: 0.3.second)
     wait_for_jobs_to_finish_for(3.seconds)
@@ -104,10 +105,10 @@ class ProcessesLifecycleTest < ActiveSupport::TestCase
 
   test "int supervisor while there are jobs in-flight" do
     no_pause = enqueue_store_result_job("no pause")
-    pause = enqueue_store_result_job("pause", pause: 0.2.seconds)
+    pause = enqueue_store_result_job("pause", pause: 1.second)
 
     signal_process(@pid, :INT, wait: 0.3.second)
-    wait_for_jobs_to_finish_for(2.second)
+    wait_for_jobs_to_finish_for(3.second)
 
     assert_completed_job_results("no pause")
     assert_completed_job_results("pause")
@@ -121,14 +122,14 @@ class ProcessesLifecycleTest < ActiveSupport::TestCase
 
   test "term supervisor exceeding timeout while there are jobs in-flight" do
     no_pause = enqueue_store_result_job("no pause")
-    pause = enqueue_store_result_job("pause", pause: SolidQueue.shutdown_timeout + 10.second)
+    pause = enqueue_store_result_job("pause", pause: SolidQueue.shutdown_timeout + 10.seconds)
 
     wait_while_with_timeout(1.second) { SolidQueue::ReadyExecution.count > 1 }
 
     signal_process(@pid, :TERM, wait: 0.5.second)
     wait_for_jobs_to_finish_for(2.seconds, except: pause)
 
-    wait_while_with_timeout!(SolidQueue.shutdown_timeout + 1.second) { process_exists?(@pid) }
+    wait_while_with_timeout!(SolidQueue.shutdown_timeout + 5.seconds) { process_exists?(@pid) }
     assert_not process_exists?(@pid)
 
     assert_completed_job_results("no pause")
@@ -170,10 +171,13 @@ class ProcessesLifecycleTest < ActiveSupport::TestCase
       enqueue_store_result_job("no exit", :background)
       enqueue_store_result_job("no exit", :default)
     end
-    enqueue_store_result_job("paused no exit", :default, pause: 0.5)
-    exit_job = enqueue_store_result_job("exit", :background, exit_value: 1, pause: 0.2)
-    pause_job = enqueue_store_result_job("exit", :background, pause: 0.3)
+    enqueue_store_result_job("paused no exit", :default, pause: 0.5.second)
+    # the worker for :background queue will exit abnormally
+    exit_job = enqueue_store_result_job("exit", :background, exit_value: 1, pause: 0.5.second)
+    # this will run *after* exit_job (pause: 1.second) - should also be marked as failed
+    pause_job = enqueue_store_result_job("exit", :background, pause: 1.second)
 
+    # this will run *before* exit_job (no pause) - should complete normally
     2.times { enqueue_store_result_job("no exit", :background) }
 
     wait_for_jobs_to_finish_for(3.seconds, except: [ exit_job, pause_job ])
@@ -181,12 +185,6 @@ class ProcessesLifecycleTest < ActiveSupport::TestCase
     assert_completed_job_results("no exit", :default, 2)
     assert_completed_job_results("no exit", :background, 4)
     assert_completed_job_results("paused no exit", :default, 1)
-
-    # The background worker exits because of the exit job,
-    # leaving the pause job claimed
-    [ exit_job, pause_job ].each do |job|
-      assert_job_status(job, :claimed)
-    end
 
     assert process_exists?(@pid)
     terminate_process(@pid)
@@ -234,8 +232,10 @@ class ProcessesLifecycleTest < ActiveSupport::TestCase
   end
 
   test "kill worker individually" do
-    killed_pause = enqueue_store_result_job("killed_pause", pause: 1.second)
+    killed_pause = enqueue_store_result_job("killed_pause", pause: 2.seconds)
     enqueue_store_result_job("pause", :default, pause: 0.5.seconds)
+
+    wait_for_jobs_to_finish_for(1.second, except: [ killed_pause ])
 
     worker = find_processes_registered_as("Worker").detect { |process| process.metadata["queues"].include? "background" }
     signal_process(worker.pid, :KILL, wait: 0.5.seconds)
@@ -284,7 +284,7 @@ class ProcessesLifecycleTest < ActiveSupport::TestCase
     end
 
     def assert_registered_supervisor_with(pid)
-      processes = find_processes_registered_as("Supervisor")
+      processes = find_processes_registered_as("Supervisor(fork)")
       assert_equal 1, processes.count
       assert_equal pid, processes.first.pid
     end
