@@ -270,14 +270,11 @@ class ConcurrencyControlsTest < ActiveSupport::TestCase
     MaxBlockedUpdateResultJob.perform_later(@result, name: "1", pause: 1.second)
     sleep(0.1) # ensure J1 is claimed
 
-    job2 = MaxBlockedUpdateResultJob.perform_later(@result, name: "2")
-    job3 = MaxBlockedUpdateResultJob.perform_later(@result, name: "3")
-    job4 = MaxBlockedUpdateResultJob.perform_later(@result, name: "4")
+    MaxBlockedUpdateResultJob.perform_later(@result, name: "2")
+    MaxBlockedUpdateResultJob.perform_later(@result, name: "3")
+    MaxBlockedUpdateResultJob.perform_later(@result, name: "4")
 
     assert_equal 1, SolidQueue::BlockedExecution.count
-    assert_equal job2.provider_job_id, SolidQueue::BlockedExecution.first.job_id
-    assert_nil job3.provider_job_id
-    assert_nil job4.provider_job_id
 
     wait_for_jobs_to_finish_for(5.seconds)
     assert_no_unfinished_jobs

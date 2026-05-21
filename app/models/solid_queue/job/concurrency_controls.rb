@@ -70,7 +70,7 @@ module SolidQueue
               BlockedExecution.create_or_find_by!(job_id: id)
             else
               SolidQueue.instrument(:max_blocked_dropped, concurrency_key: concurrency_key, dropped_job_id: id)
-              destroy
+              destroy!
             end
           end
         end
