@@ -55,28 +55,25 @@ class ConcurrencyControlsTest < ActiveSupport::TestCase
   end
 
   test "run several jobs over the same record limiting concurrency" do
-    incr = 0
     # C is the last one to update the record
     # A: 0 to 0.5
     # B: 0 to 1.0
-    # C: 0 to 1.5
+    # C: 0 to 3.0 — long enough to outlast D–H even on a loaded CI machine
     assert_no_difference -> { SolidQueue::BlockedExecution.count } do
-      ("A".."C").each do |name|
-        ThrottledUpdateResultJob.perform_later(@result, name: name, pause: (0.5 + incr).seconds)
-        incr += 0.5
+      { "A" => 0.5, "B" => 1.0, "C" => 3.0 }.each do |name, pause|
+        ThrottledUpdateResultJob.perform_later(@result, name: name, pause: pause.seconds)
       end
     end
 
-    sleep(0.01) # To ensure these aren't picked up before ABC
-    # D to H: 0.51 to 0.76 (starting after A finishes, and in order, 5 * 0.05 = 0.25)
-    # These would finish all before B and C
+    sleep(0.1) # To ensure these aren't picked up before ABC
+    # D to H: each 0.05s; all finish well before C's 3s pause is up
     assert_difference -> { SolidQueue::BlockedExecution.count }, +5 do
       ("D".."H").each do |name|
         ThrottledUpdateResultJob.perform_later(@result, name: name, pause: 0.05.seconds)
       end
     end
 
-    wait_for_jobs_to_finish_for(5.seconds)
+    wait_for_jobs_to_finish_for(10.seconds)
     assert_no_unfinished_jobs
 
     # C would have started in the beginning, seeing the status empty, and would finish after
