@@ -267,14 +267,14 @@ class ConcurrencyControlsTest < ActiveSupport::TestCase
   end
 
   test "max_blocked: drop-newer semantics — J1 runs, J2 queued, J3 and J4 dropped" do
-    MaxBlockedUpdateResultJob.perform_later(@result, name: "1", pause: 1.second)
-    sleep(0.1) # ensure J1 is claimed
+    MaxBlockedUpdateResultJob.perform_later(@result, name: "1", pause: 2.seconds)
+    sleep(0.1) # ensure J1 is claimed before the storm
 
-    MaxBlockedUpdateResultJob.perform_later(@result, name: "2")
-    MaxBlockedUpdateResultJob.perform_later(@result, name: "3")
-    MaxBlockedUpdateResultJob.perform_later(@result, name: "4")
-
-    assert_equal 1, SolidQueue::BlockedExecution.count
+    assert_difference -> { SolidQueue::BlockedExecution.count }, +1 do
+      MaxBlockedUpdateResultJob.perform_later(@result, name: "2")
+      MaxBlockedUpdateResultJob.perform_later(@result, name: "3")
+      MaxBlockedUpdateResultJob.perform_later(@result, name: "4")
+    end
 
     wait_for_jobs_to_finish_for(5.seconds)
     assert_no_unfinished_jobs
