@@ -8,7 +8,7 @@ module SolidQueue
       included do
         has_one :blocked_execution
 
-        delegate :concurrency_limit, :concurrency_duration, to: :job_class
+        delegate :concurrency_limit, :concurrency_duration, :concurrency_max_blocked, to: :job_class
 
         before_destroy :unblock_next_blocked_job, if: -> { concurrency_limited? && ready? }
       end
@@ -59,7 +59,20 @@ module SolidQueue
         end
 
         def block
-          BlockedExecution.create_or_find_by!(job_id: id)
+          return BlockedExecution.create_or_find_by!(job_id: id) unless concurrency_max_blocked
+
+          Job.transaction do
+            # Serialize concurrent enqueues for the same key via the semaphore row lock.
+            # The semaphore row is guaranteed to exist when we reach this point (see Semaphore::Proxy#wait).
+            Semaphore.lock.find_by(key: concurrency_key)
+
+            if BlockedExecution.where(concurrency_key: concurrency_key).count < concurrency_max_blocked
+              BlockedExecution.create_or_find_by!(job_id: id)
+            else
+              SolidQueue.instrument(:max_blocked_dropped, concurrency_key: concurrency_key, dropped_job_id: id)
+              destroy
+            end
+          end
         end
 
         def release_next_blocked_job

@@ -253,6 +253,74 @@ class ConcurrencyControlsTest < ActiveSupport::TestCase
     assert_stored_sequence(@result, [ "1", "3" ])
   end
 
+  test "max_blocked: cap honored — blocked count never exceeds limit under churn" do
+    # J1 starts running with a 2-second pause; 10 enqueues race in behind it
+    MaxBlockedUpdateResultJob.perform_later(@result, name: "1", pause: 2.seconds)
+    sleep(0.1) # ensure J1 is claimed before the storm
+
+    assert_difference -> { SolidQueue::BlockedExecution.count }, +1 do
+      9.times { |i| MaxBlockedUpdateResultJob.perform_later(@result, name: i.to_s) }
+    end
+
+    assert_equal 1, SolidQueue::BlockedExecution.count
+    assert_equal 8, SolidQueue::Job.where(finished_at: nil).where.not(id: SolidQueue::BlockedExecution.select(:job_id)).count + SolidQueue::Job.where.not(finished_at: nil).count - 1
+
+    wait_for_jobs_to_finish_for(10.seconds)
+    assert_no_unfinished_jobs
+  end
+
+  test "max_blocked: drop-newer semantics — J1 runs, J2 queued, J3 and J4 dropped" do
+    MaxBlockedUpdateResultJob.perform_later(@result, name: "1", pause: 1.second)
+    sleep(0.1) # ensure J1 is claimed
+
+    job2 = MaxBlockedUpdateResultJob.perform_later(@result, name: "2")
+    job3 = MaxBlockedUpdateResultJob.perform_later(@result, name: "3")
+    job4 = MaxBlockedUpdateResultJob.perform_later(@result, name: "4")
+
+    assert_equal 1, SolidQueue::BlockedExecution.count
+    assert_equal job2.provider_job_id, SolidQueue::BlockedExecution.first.job_id
+
+    # J3 and J4 were destroyed (no provider_job_id)
+    assert_nil job3.provider_job_id
+    assert_nil job4.provider_job_id
+
+    wait_for_jobs_to_finish_for(5.seconds)
+    assert_no_unfinished_jobs
+  end
+
+  test "max_blocked: nil preserves today's unbounded block behavior" do
+    NonOverlappingUpdateResultJob.perform_later(@result, name: "1", pause: 1.second)
+    sleep(0.1)
+
+    assert_difference -> { SolidQueue::BlockedExecution.count }, +9 do
+      ("2".."10").each { |name| NonOverlappingUpdateResultJob.perform_later(@result, name: name) }
+    end
+
+    wait_for_jobs_to_finish_for(10.seconds)
+    assert_no_unfinished_jobs
+  end
+
+  test "max_blocked: different keys do not interfere" do
+    another_result = JobResult.create!(queue_name: "default", status: "")
+
+    MaxBlockedUpdateResultJob.perform_later(@result, name: "A1", pause: 1.second)
+    MaxBlockedUpdateResultJob.perform_later(another_result, name: "B1", pause: 1.second)
+    sleep(0.1)
+
+    # One blocked per key allowed
+    MaxBlockedUpdateResultJob.perform_later(@result, name: "A2")
+    MaxBlockedUpdateResultJob.perform_later(another_result, name: "B2")
+
+    # These are dropped (cap hit per key)
+    MaxBlockedUpdateResultJob.perform_later(@result, name: "A3")
+    MaxBlockedUpdateResultJob.perform_later(another_result, name: "B3")
+
+    assert_equal 2, SolidQueue::BlockedExecution.count
+
+    wait_for_jobs_to_finish_for(5.seconds)
+    assert_no_unfinished_jobs
+  end
+
   private
     def assert_stored_sequence(result, sequence)
       expected = sequence.sort.map { |name| "s#{name}c#{name}" }.join
