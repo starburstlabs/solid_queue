@@ -8,7 +8,7 @@ module SolidQueue
       included do
         has_one :blocked_execution
 
-        delegate :concurrency_limit, :concurrency_duration, to: :job_class
+        delegate :concurrency_limit, :concurrency_duration, :concurrency_max_blocked, to: :job_class
 
         before_destroy :unblock_next_blocked_job, if: -> { concurrency_limited? && ready? }
       end
@@ -59,7 +59,18 @@ module SolidQueue
         end
 
         def block
-          BlockedExecution.create_or_find_by!(job_id: id)
+          return BlockedExecution.create_or_find_by!(job_id: id) unless concurrency_max_blocked
+
+          transaction do
+            # Lock the semaphore row to serialize concurrent enqueues racing to fill the cap.
+            Semaphore.lock.find_by(key: concurrency_key)
+
+            if BlockedExecution.where(concurrency_key: concurrency_key).count < concurrency_max_blocked
+              BlockedExecution.create_or_find_by!(job_id: id)
+            else
+              destroy
+            end
+          end
         end
 
         def release_next_blocked_job

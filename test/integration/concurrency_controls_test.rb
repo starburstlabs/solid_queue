@@ -235,6 +235,28 @@ class ConcurrencyControlsTest < ActiveSupport::TestCase
     assert_stored_sequence(another_result, [ "2" ])
   end
 
+  test "block up to max_blocked and discard the rest" do
+    # to: 1, max_blocked: 1 — so 1 runs, 1 blocks, the rest get discarded
+    job1 = BoundedBlockedUpdateResultJob.perform_later(@result, name: "1", pause: 0.5)
+    sleep(0.1) # ensure "1" is claimed first
+
+    job2 = BoundedBlockedUpdateResultJob.perform_later(@result, name: "2") # blocks under cap
+    job3 = BoundedBlockedUpdateResultJob.perform_later(@result, name: "3") # cap full, discarded
+    job4 = BoundedBlockedUpdateResultJob.perform_later(@result, name: "4") # cap full, discarded
+
+    wait_for_jobs_to_finish_for(5.seconds)
+    assert_no_unfinished_jobs
+
+    # 1 ran, 2 promoted after 1 finished and ran; 3 and 4 never ran
+    assert_stored_sequence(@result, [ "1", "2" ])
+
+    jobs = SolidQueue::Job.where(active_job_id: [ job1, job2, job3, job4 ].map(&:job_id))
+    assert_equal 2, jobs.count
+    assert_equal [ job1.provider_job_id, job2.provider_job_id ].sort, jobs.pluck(:id).sort
+    assert_nil job3.provider_job_id
+    assert_nil job4.provider_job_id
+  end
+
   test "discard on conflict and release semaphore" do
     DiscardableUpdateResultJob.perform_later(@result, name: "1", pause: 0.1)
     # will be discarded
