@@ -14,6 +14,18 @@ class SolidQueue::JobTest < ActiveSupport::TestCase
     limits_concurrency key: ->(job_result, **) { job_result }, on_conflict: :discard
   end
 
+  class BoundedBlockedJob < NonOverlappingJob
+    limits_concurrency key: ->(job_result, **) { job_result }, on_conflict: :block, max_blocked: 1
+  end
+
+  class BoundedBlockedThrottledJob < NonOverlappingJob
+    limits_concurrency to: 2, key: ->(job_result, **) { job_result }, on_conflict: :block, max_blocked: 2
+  end
+
+  class DiscardableWithMaxBlockedJob < NonOverlappingJob
+    limits_concurrency key: ->(job_result, **) { job_result }, on_conflict: :discard, max_blocked: 5
+  end
+
   class DiscardableThrottledJob < NonOverlappingJob
     limits_concurrency to: 2, key: ->(job_result, **) { job_result }, on_conflict: :discard
   end
@@ -134,6 +146,90 @@ class SolidQueue::JobTest < ActiveSupport::TestCase
     assert_job_counts(ready: 1) do
       DiscardableNonOverlappingJob.perform_later(@result, name: "A")
       DiscardableNonOverlappingJob.perform_later(@result, name: "B")
+    end
+  end
+
+  test "block jobs up to max_blocked, then discard further conflicts" do
+    assert_ready do
+      BoundedBlockedJob.perform_later(@result, name: "ready")
+    end
+
+    assert_blocked do
+      BoundedBlockedJob.perform_later(@result, name: "blocked")
+    end
+
+    # Cap is hit: the next two jobs should be silently discarded
+    assert_job_counts do
+      BoundedBlockedJob.perform_later(@result, name: "discarded-1")
+      BoundedBlockedJob.perform_later(@result, name: "discarded-2")
+    end
+  end
+
+  test "max_blocked cap reopens after the blocked job is released" do
+    ready_active_job = BoundedBlockedJob.perform_later(@result, name: "ready")
+    BoundedBlockedJob.perform_later(@result, name: "blocked-1")
+    ready_job, blocked_job = SolidQueue::Job.last(2)
+
+    # Cap full: this enqueue is discarded
+    assert_job_counts do
+      BoundedBlockedJob.perform_later(@result, name: "discarded")
+    end
+
+    # Discarding the ready job signals the semaphore and promotes the blocked one.
+    # Net: ready_job destroyed (-1 Job), BlockedExecution -1, ReadyExecution unchanged
+    # (one destroyed for ready_job, one created from promotion).
+    assert_job_counts(blocked: -1) do
+      ready_job.discard
+    end
+    assert blocked_job.reload.ready?
+
+    # Cap is now empty; a fresh enqueue should block again, not be discarded
+    assert_blocked do
+      BoundedBlockedJob.perform_later(@result, name: "newly-blocked")
+    end
+  end
+
+  test "max_blocked enforces the cap independently per concurrency key" do
+    another_result = JobResult.create!(queue_name: "default")
+
+    BoundedBlockedJob.perform_later(@result, name: "ready-a")
+    BoundedBlockedJob.perform_later(another_result, name: "ready-b")
+
+    assert_job_counts(blocked: 2) do
+      BoundedBlockedJob.perform_later(@result, name: "blocked-a")
+      BoundedBlockedJob.perform_later(another_result, name: "blocked-b")
+    end
+
+    # Both keys are at cap; further enqueues for either key get discarded
+    assert_job_counts do
+      BoundedBlockedJob.perform_later(@result, name: "discarded-a")
+      BoundedBlockedJob.perform_later(another_result, name: "discarded-b")
+    end
+  end
+
+  test "max_blocked respects concurrency_limit > 1" do
+    # to: 2, max_blocked: 2 => up to 2 ready + up to 2 blocked
+    assert_job_counts(ready: 2) do
+      BoundedBlockedThrottledJob.perform_later(@result, name: "ready-1")
+      BoundedBlockedThrottledJob.perform_later(@result, name: "ready-2")
+    end
+
+    assert_job_counts(blocked: 2) do
+      BoundedBlockedThrottledJob.perform_later(@result, name: "blocked-1")
+      BoundedBlockedThrottledJob.perform_later(@result, name: "blocked-2")
+    end
+
+    assert_job_counts do
+      BoundedBlockedThrottledJob.perform_later(@result, name: "discarded")
+    end
+  end
+
+  test "max_blocked is a no-op when on_conflict is :discard" do
+    # max_blocked is only consulted on the :block path; with :discard, every
+    # conflict is destroyed regardless of how many are allegedly "allowed".
+    assert_job_counts(ready: 1) do
+      DiscardableWithMaxBlockedJob.perform_later(@result, name: "ready")
+      DiscardableWithMaxBlockedJob.perform_later(@result, name: "would-have-blocked-if-cap-applied")
     end
   end
 
