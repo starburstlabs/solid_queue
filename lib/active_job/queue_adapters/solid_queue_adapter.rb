@@ -11,6 +11,13 @@ module ActiveJob
       class_attribute :stopping, default: false, instance_writer: false
       SolidQueue.on_worker_stop { self.stopping = true }
 
+      # Rails 8.2+ (rails/rails@6d1c401d) passes the job to `stopping?` from
+      # `ActiveJob::Continuable#checkpoint!`. Accept the optional positional
+      # argument so the adapter works against both old and new ActiveJob.
+      def stopping?(job = nil)
+        self.class.stopping
+      end
+
       def enqueue_after_transaction_commit?
         true
       end
