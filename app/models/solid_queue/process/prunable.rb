@@ -6,7 +6,14 @@ module SolidQueue
       extend ActiveSupport::Concern
 
       included do
-        scope :prunable, -> { where(last_heartbeat_at: ..SolidQueue.process_alive_threshold.ago) }
+        scope :prunable, -> {
+          heartbeat_cutoff = SolidQueue.process_alive_threshold.ago
+          alive_processes = where(last_heartbeat_at: heartbeat_cutoff..)
+          protected_processes = where(supervisor_id: alive_processes.select(:id))
+
+          where(last_heartbeat_at: ..heartbeat_cutoff)
+            .where.not(id: protected_processes.select(:id))
+        }
       end
 
       class_methods do
