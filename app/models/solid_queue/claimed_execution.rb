@@ -43,7 +43,6 @@ class SolidQueue::ClaimedExecution < SolidQueue::Execution
         SolidQueue.instrument(:fail_many_claimed) do |payload|
           executions.each do |execution|
             execution.failed_with(error)
-            execution.unblock_next_job
           end
 
           payload[:process_ids] = executions.map(&:process_id).uniq
@@ -71,13 +70,11 @@ class SolidQueue::ClaimedExecution < SolidQueue::Execution
       failed_with(result.error)
       raise result.error
     end
-  ensure
-    unblock_next_job
   end
 
   def release
     SolidQueue.instrument(:release_claimed, job_id: job.id, process_id: process_id) do
-      transaction do
+      with_claim do
         job.dispatch_bypassing_concurrency_limits
         destroy!
       end
@@ -89,14 +86,9 @@ class SolidQueue::ClaimedExecution < SolidQueue::Execution
   end
 
   def failed_with(error)
-    transaction do
+    finalize_claim do
       job.failed_with(error)
-      destroy!
     end
-  end
-
-  def unblock_next_job
-    job.unblock_next_blocked_job
   end
 
   private
@@ -108,9 +100,24 @@ class SolidQueue::ClaimedExecution < SolidQueue::Execution
     end
 
     def finished
-      transaction do
+      finalize_claim do
         job.finished!
+      end
+    end
+
+    def finalize_claim
+      with_claim do
+        yield
         destroy!
+        job.unblock_next_blocked_job
+      end
+    end
+
+    def with_claim
+      transaction do
+        return false unless self.class.unscoped.lock.find_by(id: id)
+
+        yield
       end
     end
 end
