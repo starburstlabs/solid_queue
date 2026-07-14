@@ -40,6 +40,7 @@ module SolidQueue
         wrap_in_app_executor do
           if registered_process = SolidQueue::Process.find_by(name: terminated_process.name)
             registered_process.fail_all_claimed_executions_with(with_error)
+            registered_process.deregister(pruned: true)
           end
         end
       end

@@ -51,8 +51,10 @@ class ProcessRecoveryTest < ActiveSupport::TestCase
     assert failed_execution.present?
     assert_equal "SolidQueue::Processes::ProcessExitError", failed_execution.exception_class
 
-    # Ensure supervisor replaces the worker (even though its own record was missing)
-    wait_for_registered_processes(2, timeout: 5.seconds)
+    # Ensure supervisor replaces the worker (even though its own record was missing).
+    # The killed worker's row is deregistered on reap, and the supervisor's own
+    # record was deleted above, so only the replacement worker remains registered.
+    wait_for_registered_processes(1, timeout: 5.seconds)
     assert_operator SolidQueue::Process.where(kind: "Worker").count, :>=, 1
   end
 end
