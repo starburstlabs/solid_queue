@@ -244,8 +244,14 @@ class ForkedProcessesLifecycleTest < ActiveSupport::TestCase
     sleep(0.5.second)
     assert SolidQueue::Process.exists?(id: worker.id)
 
-    # And there's a new worker that has been registered for the background queue
-    wait_for_registered_processes(4, timeout: 5.second)
+    # The supervisor reaps the killed worker, deregisters it, and starts a
+    # replacement. A plain count of 3 can't distinguish "not reaped yet" from
+    # "reaped and replaced" (both are 3), so wait on the dead row disappearing.
+    wait_while_with_timeout(5.seconds) { SolidQueue::Process.exists?(id: worker.id) }
+    skip_active_record_query_cache do
+      assert_not SolidQueue::Process.exists?(id: worker.id)
+      assert_equal 3, SolidQueue::Process.count
+    end
 
     # The job in the background queue would be failed by the supervisor
     # when it replaced the killed worker
