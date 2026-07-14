@@ -106,11 +106,19 @@ class SolidQueue::ClaimedExecution < SolidQueue::Execution
     end
 
     def finalize_claim
+      permit_released = false
+
       with_claim do
         yield
         destroy!
-        job.unblock_next_blocked_job
+        # Return the permit inside the claim transaction so only the claim's
+        # owner can return it. Promoting the next blocked job is done after the
+        # transaction commits, so a failure there can't roll back the finished
+        # or failed state of a job that already ran.
+        permit_released = job.release_concurrency_permit
       end
+
+      job.promote_next_blocked_job if permit_released
     end
 
     def with_claim
