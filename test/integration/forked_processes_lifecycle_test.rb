@@ -245,9 +245,12 @@ class ForkedProcessesLifecycleTest < ActiveSupport::TestCase
     assert SolidQueue::Process.exists?(id: worker.id)
 
     # The supervisor reaps the killed worker, deregisters it, and starts a
-    # replacement. A plain count of 3 can't distinguish "not reaped yet" from
-    # "reaped and replaced" (both are 3), so wait on the dead row disappearing.
+    # replacement. The reap and the replacement are separate async events, so
+    # wait for both: first the dead row disappearing, then the fleet returning to
+    # full strength. Asserting between them catches a transient count of 2 (dead
+    # row gone, replacement not registered yet).
     wait_while_with_timeout(5.seconds) { SolidQueue::Process.exists?(id: worker.id) }
+    wait_for_registered_processes(3, timeout: 5.seconds)
     skip_active_record_query_cache do
       assert_not SolidQueue::Process.exists?(id: worker.id)
       assert_equal 3, SolidQueue::Process.count
