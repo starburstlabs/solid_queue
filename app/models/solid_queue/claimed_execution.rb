@@ -74,7 +74,7 @@ class SolidQueue::ClaimedExecution < SolidQueue::Execution
 
   def release
     SolidQueue.instrument(:release_claimed, job_id: job.id, process_id: process_id) do
-      with_claim do
+      unless_already_finalized do
         job.dispatch_bypassing_concurrency_limits
         destroy!
       end
@@ -86,9 +86,7 @@ class SolidQueue::ClaimedExecution < SolidQueue::Execution
   end
 
   def failed_with(error)
-    finalize_claim do
-      job.failed_with(error)
-    end
+    finalize { job.failed_with(error) }
   end
 
   private
@@ -100,28 +98,24 @@ class SolidQueue::ClaimedExecution < SolidQueue::Execution
     end
 
     def finished
-      finalize_claim do
-        job.finished!
-      end
+      finalize { job.finished! }
     end
 
-    def finalize_claim
-      permit_released = false
-
-      with_claim do
+    def finalize
+      finalized = unless_already_finalized do
         yield
         destroy!
-        # Return the permit inside the claim transaction so only the claim's
-        # owner can return it. Promoting the next blocked job is done after the
-        # transaction commits, so a failure there can't roll back the finished
-        # or failed state of a job that already ran.
-        permit_released = job.release_concurrency_permit
+        true
       end
 
-      job.promote_next_blocked_job if permit_released
+      # Unblock the next job outside the finalize transaction so a failure while
+      # releasing the concurrency lock or dispatching the next job can't roll back
+      # a job that already finished or failed. Only the actor that owned and
+      # finalized the claim gets here, so the lock is released exactly once.
+      job.unblock_next_blocked_job if finalized
     end
 
-    def with_claim
+    def unless_already_finalized
       transaction do
         return false unless self.class.unscoped.lock.find_by(id: id)
 
