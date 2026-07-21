@@ -17,7 +17,7 @@ class SolidQueue::ClaimedExecutionTest < ActiveSupport::TestCase
     assert job.reload.finished?
   end
 
-  test "stale performer cannot return a concurrency permit after its claim is pruned" do
+  test "stale performer cannot release a concurrency lock after its claim is pruned" do
     job_result = JobResult.create!(queue_name: "default", status: "")
     first_active_job = NonOverlappingUpdateResultJob.perform_later(job_result, name: "A")
     NonOverlappingUpdateResultJob.perform_later(job_result, name: "B")

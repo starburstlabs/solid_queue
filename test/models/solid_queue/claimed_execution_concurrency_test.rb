@@ -22,9 +22,8 @@ class SolidQueue::ClaimedExecutionConcurrencyTest < ActiveSupport::TestCase
       in_transaction: ->(locked_claim) do
         first_job.failed_with(SolidQueue::Processes::ProcessPrunedError.new(1.day.ago))
         locked_claim.destroy!
-        first_job.release_concurrency_permit
       end,
-      after_commit: -> { first_job.promote_next_blocked_job }) do
+      after_commit: -> { first_job.unblock_next_blocked_job }) do
       claimed_execution.perform
     end
 
@@ -46,9 +45,8 @@ class SolidQueue::ClaimedExecutionConcurrencyTest < ActiveSupport::TestCase
       in_transaction: ->(locked_claim) do
         first_job.failed_with(SolidQueue::Processes::ProcessPrunedError.new(1.day.ago))
         locked_claim.destroy!
-        first_job.release_concurrency_permit
       end,
-      after_commit: -> { first_job.promote_next_blocked_job }) do
+      after_commit: -> { first_job.unblock_next_blocked_job }) do
       assert_raises(RuntimeError) { claimed_execution.perform }
     end
 
@@ -70,9 +68,8 @@ class SolidQueue::ClaimedExecutionConcurrencyTest < ActiveSupport::TestCase
       in_transaction: ->(locked_claim) do
         first_job.failed_with(SolidQueue::Processes::ProcessPrunedError.new(1.day.ago))
         locked_claim.destroy!
-        first_job.release_concurrency_permit
       end,
-      after_commit: -> { first_job.promote_next_blocked_job }) do
+      after_commit: -> { first_job.unblock_next_blocked_job }) do
       claimed_execution.release
     end
 
@@ -94,9 +91,8 @@ class SolidQueue::ClaimedExecutionConcurrencyTest < ActiveSupport::TestCase
       in_transaction: ->(locked_claim) do
         first_job.finished!
         locked_claim.destroy!
-        first_job.release_concurrency_permit
       end,
-      after_commit: -> { first_job.promote_next_blocked_job }) do
+      after_commit: -> { first_job.unblock_next_blocked_job }) do
       @process.prune
     end
 
@@ -135,9 +131,10 @@ class SolidQueue::ClaimedExecutionConcurrencyTest < ActiveSupport::TestCase
 
       holding_blocked_row.wait(5)
 
-      # finalize returns the permit and commits before it tries to promote, so it
-      # never holds the semaphore lock while waiting on the blocked row. Under the
-      # old in-transaction promotion this reverse lock order could deadlock.
+      # finalize releases the concurrency lock and commits before it tries to
+      # release the next blocked job, so it never holds the semaphore lock while
+      # waiting on the blocked row. Releasing the blocked job inside the claim
+      # transaction would reverse the lock order and could deadlock.
       assert_nothing_raised do
         Timeout.timeout(10) do
           finisher = Thread.new do
