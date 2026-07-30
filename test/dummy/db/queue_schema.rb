@@ -85,7 +85,10 @@ ActiveRecord::Schema[7.1].define(version: 1) do
     t.datetime "created_at", null: false
     t.index ["job_id"], name: "index_solid_queue_ready_executions_on_job_id", unique: true
     t.index ["priority", "job_id"], name: "index_solid_queue_poll_all"
+    t.index ["priority", "id"], name: "index_solid_queue_poll_all_by_id"
     t.index ["queue_name", "priority", "job_id"], name: "index_solid_queue_poll_by_queue"
+    t.index ["queue_name", "priority", "id"], name: "index_solid_queue_poll_by_queue_and_id"
+    t.index ["queue_name", "id"], name: "index_solid_queue_poll_by_queue_floored"
   end
 
   create_table "solid_queue_recurring_executions", charset: "utf8mb4", collation: "utf8mb4_0900_ai_ci", force: :cascade do |t|

@@ -46,6 +46,9 @@ class ActiveSupport::TestCase
   end
 
   setup do
+    # Tests model fresh processes: claim cursors are process-local state that
+    # must not outlive the records they were derived from
+    SolidQueue::ReadyExecution.claim_cursors.reset!
     @_on_thread_error = SolidQueue.on_thread_error
     SolidQueue.on_thread_error = silent_on_thread_error_for(ExpectedTestError, @_on_thread_error)
     ActiveJob::QueueAdapters::SolidQueueAdapter.stopping = false

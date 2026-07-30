@@ -9,13 +9,20 @@ module SolidQueue
       @relation = relation
     end
 
-    def scoped_relations
+    # Keyed by queue name, or :all for the all-queues relation -- a symbol so a
+    # queue literally named "*" cannot collide with it -- so claim cursors stay
+    # attached to their queue as the eligible set changes between polls
+    def relations_by_queue
       case
-      when all?  then [ relation.all ]
-      when none? then [ relation.none ]
+      when all?  then { all: relation.all }
+      when none? then {}
       else
-        queue_names.map { |queue_name| relation.queued_as(queue_name) }
+        queue_names.index_with { |queue_name| relation.queued_as(queue_name) }
       end
+    end
+
+    def scoped_relations
+      relations_by_queue.values
     end
 
     private

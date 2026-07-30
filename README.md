@@ -24,6 +24,7 @@ Solid Queue can be used with SQL databases such as MySQL, PostgreSQL, or SQLite,
   - [Database configuration](#database-configuration)
   - [Other configuration settings](#other-configuration-settings)
   - [Validating the configuration](#validating-the-configuration)
+- [Claim cursors on PostgreSQL](#claim-cursors-on-postgresql)
 - [Lifecycle hooks](#lifecycle-hooks)
 - [Errors when enqueuing](#errors-when-enqueuing)
 - [Concurrency controls](#concurrency-controls)
@@ -305,23 +306,25 @@ We recommend not mixing queue order with priorities but either choosing one or t
 
 ### Queues specification and performance
 
-To keep polling performant and ensure a covering index is always used, Solid Queue only does two types of polling queries:
+To keep polling performant and ensure an order-supporting index is always used, Solid Queue's classic claim path only does two types of polling queries:
 ```sql
 -- No filtering by queue
-SELECT job_id
+SELECT id, job_id, priority
 FROM solid_queue_ready_executions
-ORDER BY priority ASC, job_id ASC
+ORDER BY priority ASC, id ASC
 LIMIT ?
 FOR UPDATE SKIP LOCKED;
 
 -- Filtering by a single queue
-SELECT job_id
+SELECT id, job_id, priority
 FROM solid_queue_ready_executions
 WHERE queue_name = ?
-ORDER BY priority ASC, job_id ASC
+ORDER BY priority ASC, id ASC
 LIMIT ?
 FOR UPDATE SKIP LOCKED;
 ```
+
+On PostgreSQL, [claim cursors](#claim-cursors-on-postgresql) add a few more query shapes—a cursor-guided seek, an id-ordered window read, and a keyed lock—each covered by the polling indexes.
 
 The first one (no filtering by queue) is used when you specify
 ```yml
@@ -412,6 +415,9 @@ There are several settings that control how Solid Queue works that you can set a
 - `preserve_finished_jobs`: whether to keep finished jobs in the `solid_queue_jobs` table—defaults to `true`.
 - `clear_finished_jobs_after`: period to keep finished jobs around, in case `preserve_finished_jobs` is true — defaults to 1 day. When installing Solid Queue, [a recurring job](#recurring-tasks) is automatically configured to clear finished jobs every hour on the 12th minute in batches. You can edit the `recurring.yml` configuration to change this as you see fit.
 - `default_concurrency_control_period`: the value to be used as the default for the `duration` parameter in [concurrency controls](#concurrency-controls). It defaults to 3 minutes.
+- `claim_cursors`: whether to use [claim cursors](#claim-cursors-on-postgresql) on PostgreSQL to keep polling fast when vacuum falls behind—defaults to `true`. It has no effect on other databases.
+- `claim_cursors_discovery_interval`: how often each process runs a floored [discovery pass](#claim-cursors-on-postgresql) per queue—defaults to 1 second.
+- `claim_cursors_full_discovery_interval`: how often each process runs a full, cursor-free [discovery pass](#claim-cursors-on-postgresql) per queue—defaults to 10 seconds. Setting it to `0` makes every discovery pass full.
 
 ### Validating the configuration
 
@@ -429,6 +435,49 @@ Both commands validate the configuration for the current Rails environment. On s
 
 `bin/jobs check` accepts the same options as `bin/jobs start` (e.g. `--config_file`, `--recurring_schedule_file`, `--skip-recurring`). The rake task honors the same environment variables Solid Queue already uses: `SOLID_QUEUE_CONFIG`, `SOLID_QUEUE_RECURRING_SCHEDULE`, and `SOLID_QUEUE_SKIP_RECURRING`. To validate a specific environment's configuration, set `RAILS_ENV`, for example `RAILS_ENV=production bin/jobs check`.
 
+
+## Claim cursors on PostgreSQL
+
+On PostgreSQL, a long-running query or transaction prevents vacuum from removing dead rows (by holding back the "xmin horizon"). The claim query scans the polling index from the low end, which is exactly where the dead rows left behind by claimed jobs accumulate, so every poll re-scans them, and polling CPU grows the longer the horizon stays held.
+
+Claim cursors address this: each process remembers one `(priority, id)` position per queue and seeks directly past the dead rows in a single index scan, across all priorities. When a seek comes up empty, the position is cleared, and polls don't issue any claim query at all until the next discovery is due.
+
+A cursor is not a lower bound for live work: a competing claim of a lower id can roll back after the cursor has advanced past it, sequences are not commit-ordered, so a row can get a lower id and commit late, and an empty seek under `FOR UPDATE SKIP LOCKED` can simply mean the remaining rows were locked by another worker at that moment. Because of this, cursor-free _discovery_ queries are a fundamental part of finding work, and they come in two forms:
+
+- A _floored_ pass runs frequently (`claim_cursors_discovery_interval`, 1 second by default) and only looks at rows above the _floor_: the highest id the process had seen before its last full pass, kept in memory. Every newly enqueued row lands above the floor, so this pass finds all new work—including higher-priority jobs sitting below the cursor—without revisiting old dead rows. It reads a window of up to 500 rows in `id` order, sorts them by `(priority, id)` in memory, and locks its picks by plain id equality, so no query plan has an ordering reason to walk an index through the dead region. If degenerate statistics push the planner to a sequential scan for the window, the cost caps at one pass over the table, rather than one visit per dead row. A floored pass may set a missing cursor position but never moves an existing one.
+- A _full_ pass runs infrequently (`claim_cursors_full_discovery_interval`, 10 seconds by default, jittered a bit earlier per process so a fleet doesn't scan in lockstep). It runs the classic cursor-free query, records the next floor, and is the only pass that reaches rows at or below the floor—rolled-back claims, late commits, ids issued out of order—and the only one that may move the cursor. Setting this interval to `0` makes every discovery a full pass.
+
+With this, the cost of scanning the dead rows is paid once per full interval instead of on every poll, and the polls in between stay cheap. The tradeoffs: a row below the floor waits for the next full pass (at most the full interval plus one short one), and when more than 500 rows accumulate above the floor, claims keep strict `(priority, id)` order only within each 500-row window until it drains or the next full pass reaches past it. You can raise the full interval to spend less CPU while a horizon is held, or lower it to shrink those bounds.
+
+The floor needs nothing from the database: no catalogs, sequences, or settings are read. It relies on ids increasing over time, which is the default. A sequence with `CACHE` above 1, a `setval` rewind, or explicit id inserts just delay the affected row until the next full pass, like a late commit does, and a freshly booted process runs full passes until it has observed some ids. You can check the plans the claim queries get on your data with `EXPLAIN (ANALYZE, BUFFERS)`.
+
+This feature changes claim ordering within a priority from enqueue order (`job_id`) to the order in which jobs became ready (`id`): a scheduled job coming due now queues behind already-waiting jobs of the same priority instead of jumping ahead of them. Claims are ordered this way on every path, including when cursors are disabled, so the polling indexes need to lead with `id`. Existing installations add them alongside the current ones:
+
+```ruby
+class AddClaimCursorPollIndexes < ActiveRecord::Migration[7.1]
+  disable_ddl_transaction!
+
+  def change
+    add_index :solid_queue_ready_executions, [ :priority, :id ],
+      name: "index_solid_queue_poll_all_by_id", algorithm: :concurrently
+    add_index :solid_queue_ready_executions, [ :queue_name, :priority, :id ],
+      name: "index_solid_queue_poll_by_queue_and_id", algorithm: :concurrently
+    add_index :solid_queue_ready_executions, [ :queue_name, :id ],
+      name: "index_solid_queue_poll_by_queue_floored", algorithm: :concurrently
+  end
+end
+```
+
+Run this before deploying the upgrade: until the new indexes exist, claims fall back to sorting instead of an index scan. Keeping the old `job_id` indexes means either version of the gem has an index matching its ordering, so the upgrade and the migration can ship independently, and a rollback doesn't need any database change. New installs generate both index generations for the same reason, so a fresh schema matches a migrated one; the `job_id` pair will be dropped from the generated schema once the old ordering is retired. Note that `CREATE INDEX CONCURRENTLY` waits for transactions older than itself, so a held-back horizon can delay it considerably.
+
+After the upgrade, the old `job_id` indexes are unused and only cost write throughput and space. Dropping them with `remove_index ..., algorithm: :concurrently` is optional cleanup, safe to defer. You can confirm they're idle first:
+
+```sql
+SELECT indexrelname, idx_scan FROM pg_stat_user_indexes
+WHERE relname = 'solid_queue_ready_executions';
+```
+
+Cursors are enabled by default on PostgreSQL (`config.solid_queue.claim_cursors = false` to disable) and inactive on other databases, where this vacuum behavior doesn't apply. Note that disabling cursors keeps the readiness ordering: it's a kill switch for the cursor queries, not for the index requirement.
 
 ## Lifecycle hooks
 
