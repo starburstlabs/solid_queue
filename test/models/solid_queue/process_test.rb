@@ -55,6 +55,28 @@ class SolidQueue::ProcessTest < ActiveSupport::TestCase
     assert jobs.all?(&:failed?)
   end
 
+  test "keep a stale supervised process while its supervisor is alive" do
+    supervisor = SolidQueue::Process.register(
+      kind: "Supervisor(fork)", pid: 42, name: "supervisor-42"
+    )
+    worker = SolidQueue::Process.register(
+      kind: "Worker", pid: 43, name: "worker-43", supervisor_id: supervisor.id
+    )
+    StoreResultJob.set(queue: :new_queue).perform_later(42)
+    SolidQueue::ReadyExecution.claim("*", 1, worker.id)
+
+    travel_to 10.minutes.from_now
+    supervisor.heartbeat
+
+    assert_no_difference -> { SolidQueue::Process.count } do
+      assert_no_difference -> { SolidQueue::ClaimedExecution.count } do
+        assert_no_difference -> { SolidQueue::FailedExecution.count } do
+          SolidQueue::Process.prune
+        end
+      end
+    end
+  end
+
   test "hostname's with special characters are properly loaded" do
     worker = SolidQueue::Worker.new(queues: "*", threads: 3, polling_interval: 0.2)
     hostname = "Basecamp's-Computer"
