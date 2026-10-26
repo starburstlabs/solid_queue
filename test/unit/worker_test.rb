@@ -36,6 +36,11 @@ class WorkerTest < ActiveSupport::TestCase
         process = SolidQueue::Process.first
         assert_equal "Worker", process.kind
         assert_metadata process, queues: "background", polling_interval: 0.2, pool_type: mode[:name], pool_size: 3
+        if mode[:name] == "thread"
+          assert_metadata process, thread_pool_size: 3
+        else
+          assert_not process.metadata.key?("thread_pool_size")
+        end
       ensure
         worker&.stop
         wait_for_registered_processes(0, timeout: 1.second)
@@ -75,7 +80,7 @@ class WorkerTest < ActiveSupport::TestCase
     wait_for_registered_processes(1, timeout: 1.second)
 
     assert_equal 3, worker.pool.size
-    assert_metadata SolidQueue::Process.first, pool_type: "thread", pool_size: 3
+    assert_metadata SolidQueue::Process.first, pool_type: "thread", pool_size: 3, thread_pool_size: 3
   ensure
     worker&.stop
     wait_for_registered_processes(0, timeout: 1.second)
