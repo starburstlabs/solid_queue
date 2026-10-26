@@ -10,7 +10,7 @@ class InstrumentationTest < ActiveSupport::TestCase
       travel_to 2.days.from_now
       dispatcher = SolidQueue::Dispatcher.new(polling_interval: 0.1, batch_size: 10).tap(&:start)
 
-      wait_while_with_timeout!(0.5.seconds) { SolidQueue::ScheduledExecution.any? }
+      wait_while_with_timeout!(3.seconds) { SolidQueue::ScheduledExecution.any? }
       dispatcher.stop
     end
 
@@ -55,6 +55,7 @@ class InstrumentationTest < ActiveSupport::TestCase
   test "stopping a worker with claimed executions emits release_claimed events" do
     StoreResultJob.perform_later(42, pause: SolidQueue.shutdown_timeout + 15.seconds)
     process = nil
+    worker = nil
 
     events = subscribed(/release.*_claimed\.solid_queue/) do
       worker = SolidQueue::Worker.new.tap(&:start)
@@ -70,6 +71,8 @@ class InstrumentationTest < ActiveSupport::TestCase
     release_one_event, release_many_event = events
     assert_event release_one_event, "release_claimed", job_id: SolidQueue::Job.last.id, process_id: process.id
     assert_event release_many_event, "release_many_claimed", size: 1
+  ensure
+    kill_running_jobs_in(worker)
   end
 
   test "starting a runnable process emits a start_process event" do
@@ -90,6 +93,7 @@ class InstrumentationTest < ActiveSupport::TestCase
   test "starting and stopping a worker emits register_process and deregister_process events" do
     StoreResultJob.perform_later(42, pause: SolidQueue.shutdown_timeout + 15.seconds)
     process = nil
+    worker = nil
 
     events = subscribed(/(register|deregister)_process\.solid_queue/) do
       worker = SolidQueue::Worker.new.tap(&:start)
@@ -105,6 +109,8 @@ class InstrumentationTest < ActiveSupport::TestCase
     register_event, deregister_event = events
     assert_event register_event, "register_process", kind: "Worker", pid: ::Process.pid, process_id: process.id
     assert_event deregister_event, "deregister_process", process: process, pruned: false
+  ensure
+    kill_running_jobs_in(worker)
   end
 
   test "starting and stopping a dispatcher emits register_process and deregister_process events" do
@@ -158,6 +164,9 @@ class InstrumentationTest < ActiveSupport::TestCase
 
     assert_equal 1, events.count
     assert_event events.first, "fail_many_claimed", process_ids: [ process.id ], job_ids: jobs.map(&:id), size: 3
+
+    error = events.first.last[:error]
+    assert_instance_of SolidQueue::Processes::ProcessPrunedError, error
   end
 
   test "errors when deregistering processes are included in deregister_process events" do

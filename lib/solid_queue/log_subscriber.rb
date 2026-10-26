@@ -16,7 +16,10 @@ class SolidQueue::LogSubscriber < ActiveSupport::LogSubscriber
   end
 
   def fail_many_claimed(event)
-    warn formatted_event(event, action: "Fail claimed jobs", **event.payload.slice(:job_ids, :process_ids))
+    attributes = event.payload.slice(:job_ids, :process_ids)
+    attributes[:error] = formatted_error(event.payload[:error]) if event.payload[:error]
+
+    warn formatted_event(event, action: "Fail claimed jobs", **attributes)
   end
 
   def release_claimed(event)
@@ -56,7 +59,7 @@ class SolidQueue::LogSubscriber < ActiveSupport::LogSubscriber
   end
 
   def release_blocked(event)
-    debug formatted_event(event, action: "Release blocked job", **event.payload.slice(:job_id, :concurrency_key, :released))
+    debug formatted_event(event, action: "Release blocked job", **event.payload.slice(:job_id, :concurrency_key, :released, :failed))
   end
 
   def enqueue_recurring_task(event)
@@ -171,6 +174,11 @@ class SolidQueue::LogSubscriber < ActiveSupport::LogSubscriber
     elsif supervisor_pid != 1 # Running Docker, possibly having some processes that have been reparented
       warn formatted_event(event, action: "Tried to replace forked process but it had already died", **attributes)
     end
+  end
+
+  def fork_boot_timeout(event)
+    process = event.payload[:process]
+    warn formatted_event(event, action: "Terminate #{process.kind} that failed to boot in time", **event.payload.slice(:pid).merge(hostname: process.hostname, name: process.name))
   end
 
   private

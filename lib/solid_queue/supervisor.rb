@@ -39,9 +39,13 @@ module SolidQueue
       run_start_hooks
 
       start_processes
-      launch_maintenance_task
 
-      supervise
+      if stopped?
+        shutdown
+      else
+        launch_maintenance_task
+        supervise
+      end
     end
 
     def stop
@@ -65,25 +69,32 @@ module SolidQueue
       end
 
       def start_processes
-        configuration.configured_processes.each { |configured_process| start_process(configured_process) }
+        configuration.configured_processes.each do |configured_process|
+          # Honour signals that arrive during boot or start hooks: a queued TERM
+          # stops us here, before starting children, instead of in #supervise,
+          # after all of them have been started
+          break if time_to_stop?
+
+          start_process(configured_process)
+        end
       end
 
       def supervise
-        loop do
-          break if stopped?
-
-          if standalone?
-            set_procline
-            process_signal_queue
-          end
-
-          unless stopped?
-            check_and_replace_terminated_processes
-            interruptible_sleep(1.second)
-          end
+        until time_to_stop?
+          set_procline
+          retry_pending_cleanup
+          check_and_replace_terminated_processes
+          interruptible_sleep(1.second)
         end
       ensure
         shutdown
+      end
+
+      # Process any signals queued while we were busy and report whether
+      # we've been asked to stop
+      def time_to_stop?
+        process_signal_queue
+        stopped?
       end
 
       def start_process(configured_process)
@@ -139,7 +150,10 @@ module SolidQueue
       end
 
       def set_procline
-        procline "supervising #{configured_processes.keys.join(", ")}"
+        # Embedded supervisors don't own their process's title
+        if standalone?
+          procline "supervising #{configured_processes.keys.join(", ")}"
+        end
       end
 
       def sync_std_streams

@@ -20,18 +20,9 @@ module SolidQueue
       end
 
       def unblock_next_blocked_job
-        promote_next_blocked_job if release_concurrency_permit
-      end
-
-      # Return this job's concurrency permit. Kept separate from promotion so the
-      # permit can be returned inside the claim transaction while promoting the
-      # next blocked job happens after that transaction commits.
-      def release_concurrency_permit
-        release_concurrency_lock
-      end
-
-      def promote_next_blocked_job
-        release_next_blocked_job
+        if release_concurrency_lock
+          release_next_blocked_job
+        end
       end
 
       def concurrency_limited?
@@ -40,6 +31,10 @@ module SolidQueue
 
       def blocked?
         blocked_execution.present?
+      end
+
+      def job_class
+        @job_class ||= class_name.safe_constantize
       end
 
       private
@@ -84,10 +79,6 @@ module SolidQueue
 
         def release_next_blocked_job
           BlockedExecution.release_one(concurrency_key)
-        end
-
-        def job_class
-          @job_class ||= class_name.safe_constantize
         end
 
         def execution

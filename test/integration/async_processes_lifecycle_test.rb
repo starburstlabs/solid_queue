@@ -34,8 +34,10 @@ class AsyncProcessesLifecycleTest < ActiveSupport::TestCase
     no_pause = enqueue_store_result_job("no pause")
     pause = enqueue_store_result_job("pause", pause: 3.second)
 
-    # Wait for the "no pause" job to complete before sending KILL
+    # Wait for the "no pause" job to complete and the "pause" job to start
+    # before sending KILL, so it always arrives while "pause" is in-flight
     wait_for_jobs_to_finish_for(2.seconds, except: pause)
+    wait_while_with_timeout(3.seconds) { !JobResult.exists?(status: "started", value: "pause") }
 
     signal_process(@pid, :KILL, wait: 0.1.seconds)
     wait_for_registered_processes(1, timeout: 2.second)
@@ -64,12 +66,15 @@ class AsyncProcessesLifecycleTest < ActiveSupport::TestCase
 
   test "quit supervisor while there are jobs in-flight" do
     no_pause = enqueue_store_result_job("no pause")
-    pause = enqueue_store_result_job("pause", pause: 1.second)
+    # long enough pause to make sure it doesn't finish before QUIT arrives
+    pause = enqueue_store_result_job("pause", pause: 60.seconds)
 
-    wait_while_with_timeout(1.second) { SolidQueue::ReadyExecution.count > 0 }
+    # Wait for the "no pause" job to finish and the "pause" job to start
+    # before sending QUIT, so it always arrives while "pause" is in-flight
+    wait_for_jobs_to_finish_for(3.seconds, except: pause)
+    wait_while_with_timeout(3.seconds) { !JobResult.exists?(status: "started", value: "pause") }
 
-    signal_process(@pid, :QUIT, wait: 0.4.second)
-    wait_for_jobs_to_finish_for(2.seconds, except: pause)
+    signal_process(@pid, :QUIT, wait: 0.1.second)
 
     wait_while_with_timeout(2.seconds) { process_exists?(@pid) }
     assert_not process_exists?(@pid)
@@ -91,7 +96,12 @@ class AsyncProcessesLifecycleTest < ActiveSupport::TestCase
     no_pause = enqueue_store_result_job("no pause")
     pause = enqueue_store_result_job("pause", pause: 0.2.seconds)
 
-    signal_process(@pid, :TERM, wait: 0.3.second)
+    # Wait for the "pause" job to start, which means both jobs have been
+    # claimed, before sending TERM, so the worker finishes them while
+    # shutting down instead of stopping before it gets to claim them
+    wait_while_with_timeout(3.seconds) { !JobResult.exists?(status: "started", value: "pause") }
+
+    signal_process(@pid, :TERM, wait: 0.1.second)
     wait_for_jobs_to_finish_for(3.seconds)
 
     assert_completed_job_results("no pause")
@@ -108,7 +118,12 @@ class AsyncProcessesLifecycleTest < ActiveSupport::TestCase
     no_pause = enqueue_store_result_job("no pause")
     pause = enqueue_store_result_job("pause", pause: 0.2.seconds)
 
-    signal_process(@pid, :INT, wait: 0.3.second)
+    # Wait for the "pause" job to start, which means both jobs have been
+    # claimed, before sending INT, so the worker finishes them while
+    # shutting down instead of stopping before it gets to claim them
+    wait_while_with_timeout(3.seconds) { !JobResult.exists?(status: "started", value: "pause") }
+
+    signal_process(@pid, :INT, wait: 0.1.second)
     wait_for_jobs_to_finish_for(2.second)
 
     assert_completed_job_results("no pause")
@@ -123,12 +138,18 @@ class AsyncProcessesLifecycleTest < ActiveSupport::TestCase
 
   test "term supervisor exceeding timeout while there are jobs in-flight" do
     no_pause = enqueue_store_result_job("no pause")
-    pause = enqueue_store_result_job("pause", pause: SolidQueue.shutdown_timeout + 10.second)
+    pause = enqueue_store_result_job("pause", pause: SolidQueue.shutdown_timeout + 30.seconds)
 
-    # Wait for the "no pause" job to complete and the pause job to be claimed.
-    # This ensures the pause job is actively being processed.
+    # Wait for the "no pause" job to complete and the pause job to start.
+    # A claimed execution alone is not enough here because the worker may have
+    # claimed the job but not yet entered `perform`.
     wait_for_jobs_to_finish_for(3.seconds, except: pause)
-    wait_for(timeout: 2.seconds) { SolidQueue::ClaimedExecution.exists?(job_id: SolidQueue::Job.find_by(active_job_id: pause.job_id)&.id) }
+    wait_for(timeout: 5.seconds) do
+      skip_active_record_query_cache do
+        JobResult.where(queue_name: :background, status: "started", value: "pause").exists?
+      end
+    end
+    assert_started_job_result("pause")
 
     signal_process(@pid, :TERM, wait: 0.2.second)
     wait_for_jobs_to_finish_for(2.seconds, except: pause)
@@ -142,9 +163,15 @@ class AsyncProcessesLifecycleTest < ActiveSupport::TestCase
     assert_completed_job_results("no pause")
     assert_job_status(no_pause, :finished)
 
-    # The pause job should have started but not completed
-    assert_started_job_result("pause")
-    assert_not_equal "completed", skip_active_record_query_cache { JobResult.find_by(value: "pause")&.status }
+    # The pause job should not have completed. Its pause is far longer than this
+    # test's entire timeline, so a completed result can only come from outside
+    # the test's own flow — include enough state to tell where it came from.
+    skip_active_record_query_cache do
+      assert_not_equal "completed", JobResult.find_by(value: "pause")&.status,
+        "Expected the pause job not to complete. " \
+        "Job results: #{JobResult.all.map { |r| { id: r.id, queue: r.queue_name, status: r.status, value: r.value, updated_at: r.updated_at } }.inspect}; " \
+        "registered processes: #{SolidQueue::Process.all.map { |p| { id: p.id, kind: p.kind, pid: p.pid, last_heartbeat_at: p.last_heartbeat_at } }.inspect}"
+    end
 
     # After shutdown, the pause job may be either:
     # - claimed (exit! called, no cleanup) OR

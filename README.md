@@ -30,6 +30,7 @@ Solid Queue can be used with SQL databases such as MySQL, PostgreSQL, or SQLite,
   - [Performance considerations](#performance-considerations)
 - [Failed jobs and retries](#failed-jobs-and-retries)
   - [Error reporting on jobs](#error-reporting-on-jobs)
+  - [Jobs interrupted by non-graceful process death](#jobs-interrupted-by-non-graceful-process-death)
 - [Batch jobs](#batch-jobs)
   - [Batch progress and counters](#batch-progress-and-counters)
   - [Batch maintenance](#batch-maintenance)
@@ -209,6 +210,10 @@ Or you can also set the environment variable `SOLID_QUEUE_SUPERVISOR_MODE` to `a
 
 **The recommended and default mode is `fork`. Only use `async` if you know what you're doing and have strong reasons to**
 
+This supervisor mode is separate from a worker's concurrency model. Supervisor mode decides whether supervised processes live in forks or threads. Worker configuration decides whether claimed jobs run in a thread pool (`threads: N`) or as fibers on a single fiber reactor thread (`fibers: N`).
+
+Because these are separate concerns, you can combine the default `fork` supervisor mode with fiber workers. In that setup, each worker process gets its own fiber reactor and bounded fiber count.
+
 ## Configuration
 
 By default, Solid Queue will try to find your configuration under `config/queue.yml`, but you can set a different path using the environment variable `SOLID_QUEUE_CONFIG` or by using the `-c/--config_file` option with `bin/jobs`, like this:
@@ -218,6 +223,8 @@ bin/jobs -c config/calendar.yml
 ```
 
 You can also skip the scheduler process by setting the environment variable `SOLID_QUEUE_SKIP_RECURRING=true`. This is useful for environments like staging, review apps, or development where you don't want any recurring jobs to run. This is equivalent to using the `--skip-recurring` option with `bin/jobs`.
+
+To run **only** the scheduler (no workers or dispatchers)—for example to isolate recurring tasks on a dedicated process—set `SOLID_QUEUE_ONLY_RECURRING=true` or use the `--only-recurring` option with `bin/jobs`.
 
 This is what this configuration looks like:
 
@@ -235,6 +242,9 @@ production:
       threads: 5
       polling_interval: 0.1
       processes: 3
+    - queues: "api*"
+      fibers: 100
+      polling_interval: 0.05
   scheduler:
     dynamic_tasks_enabled: true
     polling_interval: 5
@@ -277,9 +287,11 @@ Here's an overview of the different options:
 
   Check the sections below on [how queue order behaves combined with priorities](#queue-order-and-priorities), and [how the way you specify the queues per worker might affect performance](#queues-specification-and-performance).
 
-- `threads`: this is the max size of the thread pool that each worker will have to run jobs. Each worker will fetch this number of jobs from their queue(s), at most and will post them to the thread pool to be run. By default, this is `3`. Only workers have this setting.
-It is recommended to set this value less than or equal to the queue database's connection pool size minus 2, as each worker thread uses one connection, and two additional connections are reserved for polling and heartbeat.
-- `processes`: this is the number of worker processes that will be forked by the supervisor with the settings given. By default, this is `1`, just a single process. This setting is useful if you want to dedicate more than one CPU core to a queue or queues with the same configuration. Only workers have this setting. **Note**: this option will be ignored if [running in `async` mode](#fork-vs-async-mode).
+- `threads`: configures a worker to execute jobs in a thread pool of this size. By default, workers use `threads: 3`. Only workers have this setting, and it can't be combined with `fibers`.
+It is recommended to set this value less than or equal to the queue database's connection pool size minus 2, as each worker uses connections for polling and heartbeat and thread mode may use additional connections for job execution.
+- `fibers`: configures a worker to execute jobs as fibers on a single fiber reactor thread, with this value as the maximum number of in-flight jobs. It can't be combined with `threads`.
+  Fiber workers require fiber-scoped isolated execution state. In Rails apps, set `config.active_support.isolation_level = :fiber` before using `fibers`. Solid Queue refuses to boot fiber workers when isolation remains thread-scoped. On Rails 7.2 and later, a practical starting point is usually `3-5` queue database connections per worker process rather than matching the `fibers` value, because ordinary Active Record query paths can release connections between non-blocking waits. On Rails 7.1, size the queue database pool more conservatively, as in-flight fiber jobs may still retain connections roughly in proportion to `fibers`.
+- `processes`: this is the number of worker processes that will be forked by the supervisor with the settings given. By default, this is `1`, just a single process. This setting is useful if you want to dedicate more than one CPU core to a queue or queues with the same configuration. Only workers have this setting. This works with both `threads` and `fibers` workers as long as the supervisor is running in the default `fork` mode. **Note**: this option is ignored only when the supervisor itself is [running in `async` mode](#fork-vs-async-mode).
 - `concurrency_maintenance`: whether the dispatcher will perform the concurrency maintenance work. This is `true` by default, and it's useful if you don't use any [concurrency controls](#concurrency-controls) and want to disable it or if you run multiple dispatchers and want some of them to just dispatch jobs without doing anything else.
 - `batch_maintenance`: whether the dispatcher will sweep stalled [batches](#batch-jobs) as part of its maintenance work, on the same timer as concurrency maintenance (see [batch maintenance](#batch-maintenance)). This is `true` by default; disable it if you don't use batches, or if you run multiple dispatchers and want only some of them doing maintenance work.
 
@@ -371,7 +383,17 @@ queues: back*
 
 ### Threads, processes, and signals
 
-Workers in Solid Queue use a thread pool to run work in multiple threads, configurable via the `threads` parameter above. Besides this, parallelism can be achieved via multiple processes on one machine (configurable via different workers or the `processes` parameter above) or by horizontal scaling.
+By default, workers in Solid Queue use a thread pool to run work in multiple threads, configurable via the `threads` parameter above. Workers can also be configured with `fibers`, in which case claimed jobs are executed as fibers on a single reactor thread and bounded by the worker's fiber count. Besides this, parallelism can be achieved via multiple processes on one machine (configurable via different workers or the `processes` parameter above) or by horizontal scaling.
+
+Fiber worker execution is best suited for cooperative, mostly I/O-bound jobs. Blocking or CPU-heavy work still blocks the single reactor thread, so it should not be expected to outperform thread mode for every workload.
+
+Because fiber workers run multiple fibers on a single thread, Rails must also isolate execution state per fiber rather than per thread. If your app keeps the default thread-scoped isolation level, Solid Queue will raise a boot-time error instead of running fiber workers with shared Active Record state.
+
+Keep in mind that `config.active_support.isolation_level = :fiber` applies to your whole application, not just to Solid Queue: if you run Solid Queue inside Puma via [the plugin](#puma-plugin), or combine fiber workers with thread workers in the same process using the supervisor's `async` mode, everything in that process will use fiber-scoped execution state. This is fully supported by Rails, but it's a global setting worth being deliberate about.
+
+On Rails 7.2 and later, fiber workers can often use a much smaller queue database pool than an equivalent thread pool. A practical starting point is `3-5` queue database connections per worker process: one for job execution, one for polling, one for heartbeats, plus some headroom. In the default `fork` supervisor mode, that guidance applies per worker process. In supervisor `async` mode, all workers share one process, so add together the requirements for the workers running there.
+
+That lower-pool guidance depends on job code not holding connections open across non-blocking waits. APIs such as `ActiveRecord::Base.connection`, `lease_connection`, `connection_pool.checkout`, or long-lived `with_connection` / transaction blocks can pin connections and push fiber workers back toward thread-like pool usage. On Rails 7.1, plan conservatively and assume the configured fiber count can still grow queue database connection usage.
 
 The supervisor is in charge of managing these processes, and it responds to the following signals when running in its own process via `bin/jobs` or with [the Puma plugin](#puma-plugin) with the default `fork` mode:
 - `TERM`, `INT`: starts graceful termination. The supervisor will send a `TERM` signal to its supervised processes, and it'll wait up to `SolidQueue.shutdown_timeout` time until they're done. If any supervised processes are still around by then, it'll send a `QUIT` signal to them to indicate they must exit.
@@ -383,6 +405,10 @@ On Windows, the `QUIT` signal can't be trapped, so the supervisor only responds 
 
 If processes have no chance of cleaning up before exiting (e.g. if someone pulls a cable somewhere), in-flight jobs might remain claimed by the processes executing them. Processes send heartbeats, and the supervisor checks and prunes processes with expired heartbeats. A stale supervised process isn't pruned while its supervisor has a fresh heartbeat, because the supervisor detects actual child exits directly. It becomes eligible for heartbeat-based pruning when its supervisor is also stale. Jobs claimed by a pruned process will be marked as failed with a `SolidQueue::Processes::ProcessPrunedError`. You can configure both the frequency of heartbeats and the threshold to consider a process dead. See the section below for this.
 
+Worker heartbeats are driven by a separate timer task, not by the worker execution backend itself. This means fiber workers do not rely on the reactor loop to prove liveness. However, liveness is still tracked at the worker-process level, not at the individual thread or fiber level.
+
+This means finished and failed jobs still follow the normal Solid Queue lifecycle, but a single stuck job can remain claimed if the worker process itself is still alive. If you need stronger stuck-job detection, that requires an explicit timeout or watchdog mechanism on top of process heartbeats.
+
 In a similar way, if a worker is terminated in any other way not initiated by the above signals (e.g. a worker is sent a `KILL` signal), jobs in progress will be marked as failed so that they can be inspected, with a `SolidQueue::Processes::ProcessExitError`. Sometimes a job in particular is responsible for this, for example, if it has a memory leak and you have a mechanism to kill processes over a certain memory threshold, so this will help identifying this kind of situation.
 
 
@@ -392,13 +418,23 @@ You can configure the database used by Solid Queue via the `config.solid_queue.c
 
 All the options available to Active Record for multiple databases can be used here.
 
+If you use MySQL or MariaDB, consider running the queue database with the `READ COMMITTED` transaction isolation level. Under the default `REPEATABLE READ`, InnoDB takes gap locks on the indexes Solid Queue polls, which under heavy load can occasionally deadlock jobs being enqueued against jobs being claimed or dispatched. `READ COMMITTED` avoids these gap locks and is perfectly safe for Solid Queue's own tables, and it's how we run it ourselves. You can set it per connection in your `database.yml`:
+
+```yaml
+queue:
+  <<: *default
+  database: my_app_queue
+  variables:
+    transaction_isolation: READ-COMMITTED
+```
+
 ### Other configuration settings
 
 _Note_: The settings in this section should be set in your `config/application.rb` or your environment config like this: `config.solid_queue.silence_polling = true`
 
 There are several settings that control how Solid Queue works that you can set as well:
 - `logger`: the logger you want Solid Queue to use. Defaults to the app logger.
-- `app_executor`: the [Rails executor](https://guides.rubyonrails.org/threading_and_code_execution.html#executor) used to wrap asynchronous operations, defaults to the app executor
+- `app_executor`: the [Rails executor](https://guides.rubyonrails.org/threading_and_code_execution.html#executor) used to wrap background operations, defaults to the app executor
 - `on_thread_error`: custom lambda/Proc to call when there's an error within a Solid Queue thread that takes the exception raised as argument. Defaults to
 
   ```ruby
@@ -410,8 +446,9 @@ There are several settings that control how Solid Queue works that you can set a
 - `use_skip_locked`: whether to use `FOR UPDATE SKIP LOCKED` when performing locking reads. This will be automatically detected in the future, and for now, you only need to set this to `false` if your database doesn't support it. For MySQL, that'd be versions < 8; for MariaDB, versions < 10.6; and for PostgreSQL, versions < 9.5. If you use SQLite, this has no effect, as writes are sequential.
 - `process_heartbeat_interval`: the heartbeat interval that all processes will follow—defaults to 60 seconds.
 - `process_alive_threshold`: how long to wait until a process is considered dead after its last heartbeat—defaults to 5 minutes.
+- `fork_boot_timeout`: how long a forked process can take to finish booting before the supervisor replaces it—defaults to 5 minutes. It only applies in the default `fork` mode.
 - `shutdown_timeout`: time the supervisor will wait since it sent the `TERM` signal to its supervised processes before sending a `QUIT` version to them requesting immediate termination—defaults to 5 seconds.
-- `silence_polling`: whether to silence Active Record logs emitted when polling for both workers and dispatchers—defaults to `true`.
+- `silence_polling`: whether to silence Active Record logs emitted when polling for both workers and dispatchers—defaults to `true`. On Rails 8.2 and later, you can go further and disable SQL notifications for the whole queue database connection by setting `sql_notifications: false` on it in your `database.yml`. This silences not only polling but also heartbeats, semaphores, maintenance queries, and everything else Solid Queue does on that connection, both in the logs and for any subscribers to `sql.active_record`.
 - `supervisor_pidfile`: path to a pidfile that the supervisor will create when booting to prevent running more than one supervisor in the same host, or in case you want to use it for a health check. It's `nil` by default.
 - `preserve_finished_jobs`: whether to keep finished jobs in the `solid_queue_jobs` table—defaults to `true`.
 - `clear_finished_jobs_after`: period to keep finished jobs around, in case `preserve_finished_jobs` is true — defaults to 1 day. When installing Solid Queue, [a recurring job](#recurring-tasks) is automatically configured to clear finished jobs every hour on the 12th minute in batches. You can edit the `recurring.yml` configuration to change this as you see fit.
@@ -496,7 +533,7 @@ Solid Queue extends Active Job with concurrency controls, that allows you to lim
 
 ```ruby
 class MyJob < ApplicationJob
-  limits_concurrency to: max_concurrent_executions, key: ->(arg1, arg2, *) { ... }, duration: max_interval_to_guarantee_concurrency_limit, group: concurrency_group, on_conflict: on_conflict_behaviour
+  limits_concurrency to: max_concurrent_executions, key: ->(arg1, arg2, *) { ... }, duration: max_interval_to_guarantee_concurrency_limit, group: concurrency_group, on_conflict: on_conflict_behaviour, max_blocked: max_blocked_jobs
 
   # ...
 ```
@@ -507,6 +544,7 @@ class MyJob < ApplicationJob
 - `on_conflict` controls behaviour when enqueuing a job that conflicts with the concurrency limits configured. It can be set to one of the following:
   - (default) `:block`: the job is blocked and is dispatched when another job completes and unblocks it, or when the duration expires.
   - `:discard`: the job is discarded. When you choose this option, bear in mind that if a job runs and fails to remove the concurrency lock (or _semaphore_, read below to know more about this), all jobs conflicting with it will be discarded until the interval defined by `duration` has elapsed.
+- `max_blocked` (optional) caps how many jobs can sit blocked for a given concurrency key when `on_conflict` is `:block`. Once the cap is reached, further conflicting jobs are discarded. The default is `nil` (unbounded). It is a no-op with `on_conflict: :discard`.
 
 When a job includes these controls, we'll ensure that, at most, the number of jobs (indicated as `to`) that yield the same `key` will be performed concurrently, and this guarantee will last for `duration` for each job enqueued. Note that there's no guarantee about _the order of execution_, only about jobs being performed at the same time (overlapping).
 
@@ -517,6 +555,8 @@ Since something can happen that prevents the first job from releasing the semaph
 It's important to note that after one or more candidate jobs are unblocked (either because a job finishes or because `duration` expires and a semaphore is released), the `duration` timer for the still blocked jobs is reset. This happens indirectly via the expiration time of the semaphore, which is updated.
 
 When using `discard` as the behaviour to handle conflicts, you might have jobs discarded for until the `duration` interval if something happens and a running job fails to release the semaphore.
+
+If a job's class no longer exists by the time its concurrency controls are checked—say it was renamed or removed in a deploy while jobs referencing it were still in the queue—the job is marked as failed with a `SolidQueue::Job::ClassMissingError`, so it shows up in [failed jobs](#failed-jobs-and-retries), where it can be retried once the class is back, or discarded. Jobs with a missing class picked up by a worker fail with the same error.
 
 
 For example:
@@ -602,7 +642,7 @@ production:
 Or something similar to that depending on your setup. You can also assign a different queue to a job on the moment of enqueuing so you can decide whether to enqueue a job in the throttled queue or another queue depending on the arguments, or pass a block to `queue_as` as explained [here](https://guides.rubyonrails.org/active_job_basics.html#queues).
 
 
-In addition, mixing concurrency controls with **bulk enqueuing** (Active Job's `perform_all_later`) is not a good idea because concurrency controlled job needs to be enqueued one by one to ensure concurrency limits are respected, so you lose all the benefits of bulk enqueuing.
+In addition, mixing concurrency controls with **bulk enqueuing** (Active Job's `perform_all_later`) has no benefit because concurrency-controlled jobs need to be enqueued one by one to ensure concurrency limits are respected, so you lose all the benefits of bulk enqueuing.
 
 When jobs that have concurrency controls and `on_conflict: :discard` are enqueued in bulk, the ones that fail to be enqueued and are discarded would have `successfully_enqueued` set to `false`. The total count of jobs enqueued returned by `perform_all_later` will exclude these jobs as expected.
 
@@ -642,6 +682,29 @@ class ApplicationMailer < ActionMailer::Base
     raise exception
   end
 ```
+
+### Jobs interrupted by non-graceful process death
+
+When a process dies without a clean shutdown (for example, `SIGKILL`ed by the OS or the container runtime because of memory limits), the jobs it was running can't be released back to their queues. Once another process notices the missing heartbeats and prunes the dead process's registration, its in-flight jobs are marked as failed with `SolidQueue::Processes::ProcessPrunedError`. Solid Queue deliberately doesn't retry these automatically: the job itself might be what's killing the process (for example, a job that exhausts the container's memory), and retrying it blindly would just kill the next worker too.
+
+Note that Active Job's `retry_on` and `rescue_from` have no effect on these errors: they only intercept exceptions raised while your job's `perform` method runs, and `ProcessPrunedError` (as well as `ProcessExitError` and `ProcessMissingError`) is never raised inside the job. The process that was running the job is gone by then — the error is recorded directly as a failed execution by a *different* process, after the fact, so there's no job execution left for Active Job's retry machinery to hook into. To retry these jobs, act on the failed executions from the outside instead: manually, via [Mission Control — Jobs](https://github.com/rails/mission_control-jobs), or automatically, with a subscription like the one below.
+
+If you know your jobs are idempotent and want to implement your own recovery policy, you can subscribe to the `fail_many_claimed.solid_queue` event, which includes the error and the affected job IDs in its payload:
+
+```ruby
+# config/initializers/solid_queue_recovery.rb
+ActiveSupport::Notifications.subscribe("fail_many_claimed.solid_queue") do |event|
+  if event.payload[:error].is_a?(SolidQueue::Processes::ProcessPrunedError)
+    SolidQueue::FailedExecution.where(job_id: event.payload[:job_ids]).each do |failed_execution|
+      # Apply your own safeguard against retrying the same job in a loop,
+      # e.g. a counter in the job's arguments or a cap stored elsewhere.
+      failed_execution.retry
+    end
+  end
+end
+```
+
+The event is emitted in the process that performs the pruning (or the supervisor when it reaps a crashed fork, with `SolidQueue::Processes::ProcessExitError`), so make sure the subscription is set up in an initializer, where all Solid Queue processes will load it.
 
 ## Batch jobs
 
@@ -746,6 +809,8 @@ bin/rails db:migrate
 
 Until you do, Solid Queue works exactly as before—jobs enqueue and run without any batch bookkeeping, trying to start a batch raises, and the dispatcher logs a deprecation warning to remind you the migration is pending. It becomes part of the base schema in Solid Queue 2.0.
 
+The copied migration is yours to adapt: if you're on PostgreSQL with a large jobs table, consider building the jobs index concurrently—`algorithm: :concurrently` on its `add_index`, with `disable_ddl_transaction!` on the migration—so the build doesn't block enqueues while it runs. Everything in the migration skips what already exists, so it's safe to rerun after a failure; just drop the invalid index a failed concurrent build leaves behind first.
+
 ## Puma plugin
 
 We provide a Puma plugin if you want to run the Solid Queue's supervisor together with Puma and have Puma monitor and manage it. You just need to add
@@ -761,6 +826,8 @@ plugin :solid_queue if ENV["SOLID_QUEUE_IN_PUMA"]
 that you set in production only. This is what Rails 8's default Puma config looks like. Otherwise, if you're using Puma in development but not Solid Queue, starting Puma would start also Solid Queue supervisor and it'll most likely fail because it won't be properly configured.
 
 **Note**: phased restarts are not supported currently because the plugin requires [app preloading](https://github.com/puma/puma?tab=readme-ov-file#cluster-mode) to work.
+
+The plugin ties the two processes together: if Puma goes away, the supervisor stops, and if the supervisor exits, the plugin stops Puma so that whatever manages Puma (systemd, Kamal, your container orchestrator...) restarts both. In particular, the queue database needs to be reachable when the supervisor boots, as it registers itself and cleans up after previous runs at that point; if it isn't, the supervisor exits, and Puma with it. Once running, a transient database outage doesn't bring the supervisor down: workers and dispatchers will fail and be replaced until the database is back, and then pick up where they left off.
 
 ### Running as a fork or asynchronously
 
@@ -816,6 +883,8 @@ bin/jobs --recurring_schedule_file=config/schedule.yml
 ```
 
 You can completely disable recurring tasks by setting the environment variable `SOLID_QUEUE_SKIP_RECURRING=true` or by using the `--skip-recurring` option with `bin/jobs`.
+
+To run only the scheduler (no workers or dispatchers), set `SOLID_QUEUE_ONLY_RECURRING=true` or use `--only-recurring` with `bin/jobs`.
 
 The configuration itself looks like this:
 
@@ -909,6 +978,8 @@ SolidQueue.unschedule_recurring_task("my_dynamic_task")
 ```
 
 Only dynamic tasks can be unscheduled at runtime. Attempting to unschedule a static task (defined in `config/recurring.yml`) will raise an `ActiveRecord::RecordNotFound` error.
+
+To update an existing dynamic task, unschedule it and then schedule it again with the new options. A running scheduler only detects dynamic tasks being created and deleted, so updating a `SolidQueue::RecurringTask` record in place (for example, changing its `schedule` with `update!`) won't be picked up until the scheduler restarts.
 
 Tasks scheduled like this persist between Solid Queue's restarts and won't stop running until you manually unschedule them. 
 
