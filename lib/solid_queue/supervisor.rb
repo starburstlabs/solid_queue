@@ -82,6 +82,7 @@ module SolidQueue
       def supervise
         until time_to_stop?
           set_procline
+          retry_pending_cleanup
           check_and_replace_terminated_processes
           interruptible_sleep(1.second)
         end

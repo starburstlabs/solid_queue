@@ -266,7 +266,7 @@ class ForkSupervisorTest < ActiveSupport::TestCase
     supervisor = SolidQueue::ForkSupervisor.allocate
     error = RuntimeError.new
 
-    supervisor.send(:release_claimed_jobs_by, terminated_fork, with_error: error)
+    supervisor.send(:attempt_to_release_claimed_jobs_by, terminated_fork, with_error: error)
 
     failed = SolidQueue::FailedExecution.find_by(job_id: claimed_execution.job_id)
     assert failed.present?
