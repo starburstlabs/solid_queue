@@ -288,7 +288,17 @@ class ConfigurationTest < ActiveSupport::TestCase
 
     assert configuration.valid?
     assert_equal 1, configuration.warnings.size
-    assert_match /Solid Queue needs at least \d+ database connections for the configured workers but the database connection pool is \d+\. Increase it in `config\/database.yml`/, configuration.warnings.full_messages.first
+    assert_equal "Warning: Solid Queue is configured to use 52 threads but the database connection pool is #{SolidQueue::Record.connection_pool.size}. Increase it in `config/database.yml`", configuration.warnings.full_messages.first
+  end
+
+  test "uses database connection wording when thread and fiber workers share a configuration" do
+    with_execution_isolation(:fiber) do
+      configuration = SolidQueue::Configuration.new(workers: [ { threads: 50 }, { fibers: 3 } ], skip_recurring: true)
+
+      assert configuration.valid?
+      assert_equal 1, configuration.warnings.size
+      assert_equal "Warning: Solid Queue needs at least 52 database connections for the configured workers but the database connection pool is #{SolidQueue::Record.connection_pool.size}. Increase it in `config/database.yml`", configuration.warnings.full_messages.first
+    end
   end
 
   test "has no warnings when the database connection pool is large enough" do
@@ -321,7 +331,7 @@ class ConfigurationTest < ActiveSupport::TestCase
     end
 
     assert_match "Solid Queue configuration is valid.", out
-    assert_match /Solid Queue needs at least \d+ database connections for the configured workers but the database connection pool is \d+/, err
+    assert_match /Solid Queue is configured to use 52 threads but the database connection pool is \d+/, err
   end
 
   test "check prints errors to stderr and returns false for an invalid configuration" do
