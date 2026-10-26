@@ -29,7 +29,9 @@ module SolidQueue
     end
 
     def metadata
-      super.merge(queues: queues.join(","), pool_type: pool.type, pool_size: pool.size)
+      metadata = super.merge(queues: queues.join(","), pool_type: pool.type, pool_size: pool.size)
+      metadata[:thread_pool_size] = pool.size if pool.type == :thread
+      metadata
     end
 
     private
