@@ -107,8 +107,13 @@ module SolidQueue
         db_pool_size = SolidQueue::Record.connection_pool&.size
 
         if db_pool_size && db_pool_size < estimated_database_pool_size
-          warnings.add(:base, "Warning: Solid Queue needs at least #{estimated_database_pool_size} database connections " \
-            "for the configured workers but the database connection pool is #{db_pool_size}. Increase it in `config/database.yml`")
+          worker_requirement = if workers_options.any? { |options| fiber_worker?(options) }
+            "needs at least #{estimated_database_pool_size} database connections for the configured workers"
+          else
+            "is configured to use #{estimated_database_pool_size} threads"
+          end
+
+          warnings.add(:base, "Warning: Solid Queue #{worker_requirement} but the database connection pool is #{db_pool_size}. Increase it in `config/database.yml`")
         end
       rescue ActiveRecord::ActiveRecordError
         # No usable database connection. Skip the pool-size warning in that case.
