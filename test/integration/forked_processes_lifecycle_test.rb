@@ -263,12 +263,11 @@ class ForkedProcessesLifecycleTest < ActiveSupport::TestCase
     worker = find_processes_registered_as("Worker").detect { |process| process.metadata["queues"].include? "background" }
     signal_process(worker.pid, :KILL, wait: 0.5.seconds)
 
-    # Worker didn't have time to clean up or finish the work
-    sleep(0.5.second)
-    assert SolidQueue::Process.exists?(id: worker.id)
+    wait_while_with_timeout(5.seconds) { SolidQueue::Process.exists?(id: worker.id) }
+    assert_not SolidQueue::Process.exists?(id: worker.id)
 
-    # And there's a new worker that has been registered for the background queue
-    wait_for_registered_processes(4, timeout: 5.second)
+    wait_for_registered_processes(3, timeout: 5.seconds)
+    assert_registered_workers_for(:background, :default, supervisor_pid: @pid)
 
     # The job in the background queue would be failed by the supervisor
     # when it replaced the killed worker
