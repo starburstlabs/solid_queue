@@ -197,10 +197,7 @@ class SupervisorMaintenanceTest < ActiveSupport::TestCase
   end
 
   test "shutdown stops an embedded async heartbeat while retaining pending cleanup" do
-    configuration = SolidQueue::Configuration.new(mode: :async, standalone: false, workers: [], dispatchers: [], skip_recurring: true)
-    @supervisor = SolidQueue::AsyncSupervisor.new(configuration)
-    @supervisor.stubs(:handle_thread_error)
-    @supervisor.send(:process=, @parent)
+    use_async_supervisor
     @supervisor.send(:launch_heartbeat)
     heartbeat = @supervisor.instance_variable_get(:@heartbeat_task)
     fail_worker_lookup { release_worker }
@@ -215,7 +212,33 @@ class SupervisorMaintenanceTest < ActiveSupport::TestCase
     heartbeat&.shutdown
   end
 
+  test "async shutdown timeout releases the tracked worker's claim and preserves the dead worker's claim" do
+    use_async_supervisor
+    fail_worker_lookup { release_worker }
+    live_worker = register_worker
+    live_claim = claim_job(live_worker)
+    @supervisor.send(:process_instances)[42] = stub(name: live_worker.name, alive?: true, stop: nil)
+
+    SolidQueue.with(shutdown_timeout: 0.01.seconds) { @supervisor.send(:perform_graceful_termination) }
+
+    assert_not SolidQueue::ReadyExecution.exists?(job_id: @claim.job_id), "Async shutdown requeued the dead worker's job"
+    assert SolidQueue::ClaimedExecution.exists?(@claim.id)
+    assert SolidQueue::Process.exists?(@worker.id)
+    assert SolidQueue::Process.exists?(@parent.id)
+
+    assert SolidQueue::ReadyExecution.exists?(job_id: live_claim.job_id)
+    assert_not SolidQueue::ClaimedExecution.exists?(live_claim.id)
+    assert_not SolidQueue::Process.exists?(live_worker.id)
+  end
+
   private
+    def use_async_supervisor
+      configuration = SolidQueue::Configuration.new(mode: :async, standalone: false, workers: [], dispatchers: [], skip_recurring: true)
+      @supervisor = SolidQueue::AsyncSupervisor.new(configuration)
+      @supervisor.stubs(:handle_thread_error)
+      @supervisor.send(:process=, @parent)
+    end
+
     def register_worker
       SolidQueue::Process.register(kind: "Worker", pid: 900002, name: SecureRandom.hex, supervisor_id: @parent.id)
     end
