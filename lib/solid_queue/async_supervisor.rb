@@ -52,7 +52,12 @@ module SolidQueue
         wrap_in_app_executor do
           # Not our own copy: it shares the threads' registrations in memory, and
           # those of threads that already deregistered are destroyed and frozen
-          SolidQueue::Process.find_by(id: process_id)&.deregister
+          if pending_cleanup.empty?
+            SolidQueue::Process.find_by(id: process_id)&.deregister
+          else
+            tracked_names = process_instances.values.map(&:name)
+            SolidQueue::Process.where(supervisor_id: process_id, name: tracked_names).find_each(&:deregister)
+          end
         end
       rescue StandardError => error
         handle_thread_error(error)
