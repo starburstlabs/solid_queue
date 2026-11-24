@@ -16,6 +16,8 @@ loader = Zeitwerk::Loader.for_gem(warn_on_extra_files: false)
 loader.ignore("#{__dir__}/solid_queue/tasks.rb")
 loader.ignore("#{__dir__}/generators")
 loader.ignore("#{__dir__}/puma")
+# Only bin/jobs uses the CLI, and requires it. Eager loading it would load Thor in every process.
+loader.do_not_eager_load("#{__dir__}/solid_queue/cli.rb")
 loader.setup
 
 module SolidQueue
@@ -30,6 +32,7 @@ module SolidQueue
 
   mattr_accessor :process_heartbeat_interval, default: 60.seconds
   mattr_accessor :process_alive_threshold, default: 5.minutes
+  mattr_accessor :fork_boot_timeout, default: 5.minutes
 
   mattr_accessor :shutdown_timeout, default: 5.seconds
 

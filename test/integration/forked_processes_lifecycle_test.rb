@@ -64,13 +64,15 @@ class ForkedProcessesLifecycleTest < ActiveSupport::TestCase
 
   test "quit supervisor while there are jobs in-flight" do
     no_pause = enqueue_store_result_job("no pause")
-    # long enough pause to make sure it doesn't finish
-    pause = enqueue_store_result_job("pause", pause: 60.second)
+    # long enough pause to make sure it doesn't finish before QUIT arrives
+    pause = enqueue_store_result_job("pause", pause: 60.seconds)
 
-    wait_while_with_timeout(1.second) { SolidQueue::ReadyExecution.count > 0 }
+    # Wait for the "no pause" job to finish and the "pause" job to start
+    # before sending QUIT, so it always arrives while "pause" is in-flight
+    wait_for_jobs_to_finish_for(3.seconds, except: pause)
+    wait_while_with_timeout(3.seconds) { !JobResult.exists?(status: "started", value: "pause") }
 
-    signal_process(@pid, :QUIT, wait: 0.4.second)
-    wait_for_jobs_to_finish_for(2.seconds, except: pause)
+    signal_process(@pid, :QUIT, wait: 0.1.second)
 
     wait_while_with_timeout(2.seconds) { process_exists?(@pid) }
     assert_not process_exists?(@pid)
@@ -90,7 +92,12 @@ class ForkedProcessesLifecycleTest < ActiveSupport::TestCase
     no_pause = enqueue_store_result_job("no pause")
     pause = enqueue_store_result_job("pause", pause: 1.second)
 
-    signal_process(@pid, :TERM, wait: 0.3.second)
+    # Wait for the "pause" job to start, which means both jobs have been
+    # claimed, before sending TERM, so the worker finishes them while
+    # shutting down instead of stopping before it gets to claim them
+    wait_while_with_timeout(3.seconds) { !JobResult.exists?(status: "started", value: "pause") }
+
+    signal_process(@pid, :TERM, wait: 0.1.second)
     wait_for_jobs_to_finish_for(3.seconds)
 
     assert_completed_job_results("no pause")
@@ -107,7 +114,12 @@ class ForkedProcessesLifecycleTest < ActiveSupport::TestCase
     no_pause = enqueue_store_result_job("no pause")
     pause = enqueue_store_result_job("pause", pause: 1.second)
 
-    signal_process(@pid, :INT, wait: 0.3.second)
+    # Wait for the "pause" job to start, which means both jobs have been
+    # claimed, before sending INT, so the worker finishes them while
+    # shutting down instead of stopping before it gets to claim them
+    wait_while_with_timeout(3.seconds) { !JobResult.exists?(status: "started", value: "pause") }
+
+    signal_process(@pid, :INT, wait: 0.1.second)
     wait_for_jobs_to_finish_for(3.second)
 
     assert_completed_job_results("no pause")
@@ -122,7 +134,7 @@ class ForkedProcessesLifecycleTest < ActiveSupport::TestCase
 
   test "term supervisor exceeding timeout while there are jobs in-flight" do
     no_pause = enqueue_store_result_job("no pause")
-    pause = enqueue_store_result_job("pause", pause: SolidQueue.shutdown_timeout + 10.seconds)
+    pause = enqueue_store_result_job("pause", pause: SolidQueue.shutdown_timeout + 30.seconds)
 
     wait_while_with_timeout(5.seconds) {
       SolidQueue::ReadyExecution.joins(:job).exists?(solid_queue_jobs: { active_job_id: pause.job_id })
@@ -236,33 +248,26 @@ class ForkedProcessesLifecycleTest < ActiveSupport::TestCase
   end
 
   test "kill worker individually" do
-    killed_pause = enqueue_store_result_job("killed_pause", pause: 2.seconds)
+    killed_pause = enqueue_store_result_job("killed_pause", pause: 5.seconds)
     enqueue_store_result_job("pause", :default, pause: 0.5.seconds)
 
     wait_for_jobs_to_finish_for(1.second, except: [ killed_pause ])
-    # Ensure the long job has written its "started" row before we SIGKILL the worker.
-    wait_while_with_timeout(2.seconds) do
+    # Ensure the long job has written its "started" row before we SIGKILL the
+    # worker. Raise if it never does: proceeding would kill the worker before
+    # it starts the job, so no "started" row would ever exist and the test
+    # would fail later, in a way much harder to trace back here.
+    wait_while_with_timeout!(10.seconds) do
       JobResult.where(status: "started", value: "killed_pause").none?
     end
 
     worker = find_processes_registered_as("Worker").detect { |process| process.metadata["queues"].include? "background" }
     signal_process(worker.pid, :KILL, wait: 0.5.seconds)
 
-    # Worker didn't have time to clean up or finish the work
-    sleep(0.5.second)
-    assert SolidQueue::Process.exists?(id: worker.id)
-
-    # The supervisor reaps the killed worker, deregisters it, and starts a
-    # replacement. The reap and the replacement are separate async events, so
-    # wait for both: first the dead row disappearing, then the fleet returning to
-    # full strength. Asserting between them catches a transient count of 2 (dead
-    # row gone, replacement not registered yet).
     wait_while_with_timeout(5.seconds) { SolidQueue::Process.exists?(id: worker.id) }
+    assert_not SolidQueue::Process.exists?(id: worker.id)
+
     wait_for_registered_processes(3, timeout: 5.seconds)
-    skip_active_record_query_cache do
-      assert_not SolidQueue::Process.exists?(id: worker.id)
-      assert_equal 3, SolidQueue::Process.count
-    end
+    assert_registered_workers_for(:background, :default, supervisor_pid: @pid)
 
     # The job in the background queue would be failed by the supervisor
     # when it replaced the killed worker

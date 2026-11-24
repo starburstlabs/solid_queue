@@ -67,6 +67,34 @@ class SolidQueue::ReadyExecutionTest < ActiveSupport::TestCase
     assert @jobs.none?(&:claimed?)
   end
 
+  test "prefixes escape LIKE wildcards so only literal queue names match" do
+    AddToBufferJob.set(queue: "mailbox").perform_later(1)
+    AddToBufferJob.set(queue: "mail-ops").perform_later(1)
+
+    assert_claimed_jobs(0) do
+      SolidQueue::ReadyExecution.claim("mail_*", SolidQueue::Job.count + 1, 42)
+    end
+
+    AddToBufferJob.set(queue: "mail_ops").perform_later(1)
+    AddToBufferJob.set(queue: "100x_done").perform_later(1)
+
+    assert_claimed_jobs(1) do
+      SolidQueue::ReadyExecution.claim("mail_*", SolidQueue::Job.count + 1, 42)
+    end
+    assert_equal "mail_ops", SolidQueue::ClaimedExecution.last.job.queue_name
+
+    assert_claimed_jobs(0) do
+      SolidQueue::ReadyExecution.claim("100%_*", SolidQueue::Job.count + 1, 42)
+    end
+
+    AddToBufferJob.set(queue: "100%_done").perform_later(1)
+
+    assert_claimed_jobs(1) do
+      SolidQueue::ReadyExecution.claim("100%_*", 1, 42)
+    end
+    assert_equal "100%_done", SolidQueue::ClaimedExecution.last.job.queue_name
+  end
+
   test "claim jobs using a wildcard and having paused queues" do
     AddToBufferJob.perform_later("hey")
 
@@ -168,6 +196,13 @@ class SolidQueue::ReadyExecutionTest < ActiveSupport::TestCase
       claimed_jobs.map(&:queue_name)
   end
 
+  test "queues matched by more than one entry in the list are selected once" do
+    AddToBufferJob.set(queue: "queue_b1").perform_later(1)
+
+    assert_equal 1, SolidQueue::ReadyExecution.aggregated_count_across(%w[ queue_* queue_b* ])
+    assert_equal 1, SolidQueue::ReadyExecution.aggregated_count_across(%w[ queue_b* queue_b1 ])
+  end
+
   test "distinct_values_of returns all distinct queue names" do
     AddToBufferJob.perform_later("hey") # goes to background queue
 
@@ -220,6 +255,40 @@ class SolidQueue::ReadyExecutionTest < ActiveSupport::TestCase
     assert_no_difference [ -> { SolidQueue::ReadyExecution.count }, -> { SolidQueue::Job.count } ] do
       SolidQueue::ReadyExecution.queued_as(:backend).discard_all_in_batches
     end
+  end
+
+  test "bulk discard unblocks one job for each released concurrency slot" do
+    result = JobResult.create!
+    7.times { |i| ThrottledUpdateResultJob.perform_later(result, name: i.to_s) }
+    jobs = SolidQueue::Job.where(class_name: ThrottledUpdateResultJob.name).order(:id).to_a
+
+    assert_equal 4, SolidQueue::BlockedExecution.count
+
+    assert_difference -> { SolidQueue::Job.count } => -2, -> { SolidQueue::BlockedExecution.count } => -2 do
+      SolidQueue::ReadyExecution.discard_all_from_jobs(jobs.first(2))
+    end
+
+    assert_equal jobs[2..4].map(&:id), SolidQueue::ReadyExecution.where(job_id: jobs.map(&:id)).order(:job_id).pluck(:job_id)
+    assert jobs.last(2).all? { |job| job.reload.blocked? }
+    assert_equal 0, SolidQueue::Semaphore.find_by!(key: jobs.first.concurrency_key).value
+  end
+
+  test "discard in batches leaves newly unblocked jobs ready" do
+    blocked_jobs = 2.times.map do
+      result = JobResult.create!
+      NonOverlappingUpdateResultJob.perform_later(result, name: "ready")
+      NonOverlappingUpdateResultJob.perform_later(result, name: "blocked")
+      SolidQueue::Job.last
+    end
+
+    assert_difference -> { SolidQueue::Job.count }, -2 do
+      SolidQueue::ReadyExecution.queued_as("default").discard_all_in_batches(batch_size: 1)
+    end
+
+    assert_equal blocked_jobs.map(&:id), SolidQueue::Job.where(queue_name: "default").order(:id).pluck(:id)
+    assert blocked_jobs.all? { |job| job.reload.ready? }
+    assert_equal 0, SolidQueue::BlockedExecution.count
+    assert_equal [ 0, 0 ], SolidQueue::Semaphore.order(:id).pluck(:value)
   end
 
   private

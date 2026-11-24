@@ -10,6 +10,7 @@ module SolidQueue
       @static_tasks = Array(static_tasks).map { |task| RecurringTask.wrap(task) }.select(&:valid?)
       @dynamic_tasks_enabled = dynamic_tasks_enabled
 
+      @schedule_lock = Mutex.new
       @scheduled_tasks = Concurrent::Hash.new
     end
 
@@ -28,18 +29,16 @@ module SolidQueue
         reload_dynamic_tasks
       end
 
-      configured_tasks.each do |task|
-        schedule_task(task)
+      schedule_lock.synchronize do
+        configured_tasks.each { |task| schedule_task(task) }
       end
     end
 
-    def schedule_task(task, run_at: task.next_time)
-      scheduled_tasks[task.key] = schedule(task, run_at: run_at)
-    end
-
     def unschedule_tasks
-      scheduled_tasks.values.each(&:cancel)
-      scheduled_tasks.clear
+      schedule_lock.synchronize do
+        scheduled_tasks.values.each(&:cancel)
+        scheduled_tasks.clear
+      end
     end
 
     def task_keys
@@ -49,13 +48,16 @@ module SolidQueue
     def reschedule_dynamic_tasks
       wrap_in_app_executor do
         reload_dynamic_tasks
-        schedule_created_dynamic_tasks
-        unschedule_deleted_dynamic_tasks
+
+        schedule_lock.synchronize do
+          schedule_created_dynamic_tasks
+          unschedule_deleted_dynamic_tasks
+        end
       end
     end
 
     private
-      attr_reader :static_tasks
+      attr_reader :static_tasks, :schedule_lock
 
       def static_task_keys
         static_tasks.map(&:key)
@@ -69,17 +71,20 @@ module SolidQueue
         @dynamic_tasks_enabled
       end
 
+      # Scheduled tasks are tracked by record id, so a dynamic task that's deleted and
+      # created again with the same key is unscheduled and scheduled as a new one.
       def schedule_created_dynamic_tasks
-        RecurringTask.dynamic.where.not(key: scheduled_tasks.keys).each do |task|
-          schedule_task(task)
-        end
+        dynamic_tasks.reject { |task| scheduled_tasks.key?(task.id) }.each { |task| schedule_task(task) }
       end
 
       def unschedule_deleted_dynamic_tasks
-        (scheduled_tasks.keys - RecurringTask.pluck(:key)).each do |key|
-          scheduled_tasks[key].cancel
-          scheduled_tasks.delete(key)
+        (scheduled_tasks.keys - static_tasks.map(&:id) - dynamic_tasks.map(&:id)).each do |id|
+          scheduled_tasks.delete(id).cancel
         end
+      end
+
+      def schedule_task(task, run_at: task.next_time)
+        scheduled_tasks[task.id] = schedule(task, run_at: run_at)
       end
 
       def persist_static_tasks
@@ -102,8 +107,8 @@ module SolidQueue
       def schedule(task, run_at: task.next_time)
         delay = [ (run_at - Time.current).to_f, 0.1 ].max
 
-        scheduled_task = Concurrent::ScheduledTask.new(delay, args: [ self, task, run_at ]) do |thread_schedule, thread_task, thread_task_run_at|
-          thread_schedule.schedule_task(thread_task, run_at: thread_task.next_time_after(thread_task_run_at))
+        scheduled_task = Concurrent::ScheduledTask.new(delay, args: [ task, run_at ]) do |thread_task, thread_task_run_at|
+          schedule_next_run(thread_task, run_at: thread_task.next_time_after(thread_task_run_at))
 
           wrap_in_app_executor do
             thread_task.enqueue(at: thread_task_run_at)
@@ -117,6 +122,13 @@ module SolidQueue
         end
 
         scheduled_task.tap(&:execute)
+      end
+
+      # Only schedule the next run if the task wasn't unscheduled in the meantime
+      def schedule_next_run(task, run_at:)
+        schedule_lock.synchronize do
+          schedule_task(task, run_at: run_at) if scheduled_tasks.key?(task.id)
+        end
       end
   end
 end

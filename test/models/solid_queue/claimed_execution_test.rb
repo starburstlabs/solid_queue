@@ -17,6 +17,35 @@ class SolidQueue::ClaimedExecutionTest < ActiveSupport::TestCase
     assert job.reload.finished?
   end
 
+  test "raises FinalizationError when finishing fails while the claim remains" do
+    claimed_execution = prepare_and_claim_job AddToBufferJob.perform_later(42)
+
+    SolidQueue::ClaimedExecution.any_instance.stubs(:finished).raises(ActiveRecord::StatementInvalid.new("transient DB glitch"))
+
+    error = assert_raises SolidQueue::ClaimedExecution::FinalizationError do
+      claimed_execution.perform
+    end
+
+    assert_match(/transient DB glitch/, error.message)
+    assert_equal ActiveRecord::StatementInvalid, error.cause.class
+    assert SolidQueue::ClaimedExecution.exists?(claimed_execution.id)
+    assert_not claimed_execution.job.reload.finished?
+  end
+
+  test "raises FinalizationError when failing the job fails while the claim remains" do
+    claimed_execution = prepare_and_claim_job RaisingJob.perform_later(RuntimeError, "A")
+
+    SolidQueue::ClaimedExecution.any_instance.stubs(:failed_with).raises(ActiveRecord::StatementInvalid.new("transient DB glitch"))
+
+    error = assert_raises SolidQueue::ClaimedExecution::FinalizationError do
+      claimed_execution.perform
+    end
+
+    assert_match(/transient DB glitch/, error.message)
+    assert SolidQueue::ClaimedExecution.exists?(claimed_execution.id)
+    assert_not claimed_execution.job.reload.failed?
+  end
+
   test "stale performer cannot release a concurrency lock after its claim is pruned" do
     job_result = JobResult.create!(queue_name: "default", status: "")
     first_active_job = NonOverlappingUpdateResultJob.perform_later(job_result, name: "A")
@@ -117,7 +146,7 @@ class SolidQueue::ClaimedExecutionTest < ActiveSupport::TestCase
     claimed_execution = claim_job(job)
 
     assert_difference -> { SolidQueue::ClaimedExecution.count } => -1, -> { SolidQueue::FailedExecution.count } => 1 do
-      assert_raises NameError do
+      assert_raises SolidQueue::Job::ClassMissingError do
         claimed_execution.perform
       end
     end
@@ -130,7 +159,7 @@ class SolidQueue::ClaimedExecutionTest < ActiveSupport::TestCase
     claimed_execution = claim_job(job)
 
     assert_difference -> { SolidQueue::ClaimedExecution.count } => -1, -> { SolidQueue::FailedExecution.count } => 1 do
-      assert_raises NameError do
+      assert_raises SolidQueue::Job::ClassMissingError do
         claimed_execution.perform
       end
     end
@@ -141,7 +170,7 @@ class SolidQueue::ClaimedExecutionTest < ActiveSupport::TestCase
   test "dispatch job with missing class and concurrency key skips concurrency controls" do
     job = create_job_with_missing_class(concurrency_key: "test_key")
 
-    assert_not job.concurrency_limited?
+    assert_nil job.job_class
 
     job.prepare_for_execution
 
@@ -156,6 +185,16 @@ class SolidQueue::ClaimedExecutionTest < ActiveSupport::TestCase
     claimed_execution.perform
 
     assert_equal "provider_job_id: #{job.provider_job_id}", JobBuffer.last_value
+  end
+
+  test "discarding claimed executions in bulk raises UndiscardableError" do
+    assert_raises SolidQueue::Execution::UndiscardableError do
+      SolidQueue::ClaimedExecution.discard_all_in_batches
+    end
+
+    assert_raises SolidQueue::Execution::UndiscardableError do
+      SolidQueue::ClaimedExecution.discard_all_from_jobs([])
+    end
   end
 
   private

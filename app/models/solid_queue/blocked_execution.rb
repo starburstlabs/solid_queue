@@ -46,7 +46,12 @@ module SolidQueue
     def release
       SolidQueue.instrument(:release_blocked, job_id: job.id, concurrency_key: concurrency_key, released: false) do |payload|
         transaction do
-          if acquire_concurrency_lock
+          if job.job_class.nil?
+            job.failed_with(Job::ClassMissingError.for(job))
+            destroy!
+
+            payload[:failed] = true
+          elsif job.acquire_concurrency_lock
             promote_to_ready
             destroy!
 
@@ -59,10 +64,6 @@ module SolidQueue
     private
       def set_expires_at
         self.expires_at = job.concurrency_duration.from_now
-      end
-
-      def acquire_concurrency_lock
-        Semaphore.wait(job)
       end
 
       def promote_to_ready

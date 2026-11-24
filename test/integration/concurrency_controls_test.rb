@@ -6,9 +6,9 @@ class ConcurrencyControlsTest < ActiveSupport::TestCase
   self.use_transactional_tests = false
 
   setup do
-    # Previous tests may leave forked workers briefly alive; those can still write to
-    # JobResult rows whose primary keys get reused by create! below (e.g. overwriting
-    # status with StoreResultJob's default "completed").
+    # Wait for processes from previous tests to deregister first: leftover workers
+    # polling the same queues could claim this test's jobs. Then clear any records
+    # they might have left behind.
     wait_for_registered_processes(0, timeout: 5.seconds)
     destroy_records
 
@@ -75,10 +75,13 @@ class ConcurrencyControlsTest < ActiveSupport::TestCase
     # and B finish quickly, freeing slots that drain D–H; C reads the empty
     # status and pauses far longer than everyone else, so it saves last and its
     # write (built on the empty status) overwrites all the others, leaving "C".
+    # A and B must pause long enough to still hold their semaphore slots while
+    # D–H are being enqueued, even on a slow CI runner — otherwise some of D–H
+    # claim a freed slot instead of blocking.
     assert_no_difference -> { SolidQueue::BlockedExecution.count } do
-      ThrottledUpdateResultJob.perform_later(@result, name: "A", pause: 0.5.seconds)
-      ThrottledUpdateResultJob.perform_later(@result, name: "B", pause: 0.5.seconds)
-      ThrottledUpdateResultJob.perform_later(@result, name: "C", pause: 3.seconds)
+      ThrottledUpdateResultJob.perform_later(@result, name: "A", pause: 1.5.seconds)
+      ThrottledUpdateResultJob.perform_later(@result, name: "B", pause: 1.5.seconds)
+      ThrottledUpdateResultJob.perform_later(@result, name: "C", pause: 4.seconds)
     end
 
     wait_for(timeout: 2.seconds) { SolidQueue::ClaimedExecution.count >= 3 }
@@ -113,7 +116,7 @@ class ConcurrencyControlsTest < ActiveSupport::TestCase
 
   test "rely on dispatcher to unblock blocked executions with an available semaphore" do
     # Simulate a scenario where we got an available semaphore and some stuck jobs
-    job = NonOverlappingUpdateResultJob.perform_later(@result, name: "A")
+    job = SolidQueue::Job.find_by!(active_job_id: NonOverlappingUpdateResultJob.perform_later(@result, name: "A").job_id)
 
     wait_for_jobs_to_finish_for(5.seconds)
     assert_no_unfinished_jobs
@@ -145,7 +148,7 @@ class ConcurrencyControlsTest < ActiveSupport::TestCase
 
   test "rely on dispatcher to unblock blocked executions with an expired semaphore" do
     # Simulate a scenario where we got an available semaphore and some stuck jobs
-    job = NonOverlappingUpdateResultJob.perform_later(@result, name: "A")
+    job = SolidQueue::Job.find_by!(active_job_id: NonOverlappingUpdateResultJob.perform_later(@result, name: "A").job_id)
     wait_for_jobs_to_finish_for(5.seconds)
     assert_no_unfinished_jobs
 
@@ -174,7 +177,7 @@ class ConcurrencyControlsTest < ActiveSupport::TestCase
   end
 
   test "don't block claimed executions that get released" do
-    NonOverlappingUpdateResultJob.perform_later(@result, name: "I'll be released to ready", pause: SolidQueue.shutdown_timeout + 10.seconds)
+    NonOverlappingUpdateResultJob.perform_later(@result, name: "I'll be released to ready", pause: SolidQueue.shutdown_timeout + 30.seconds)
     job = SolidQueue::Job.last
 
     wait_for(timeout: 2.seconds) { job.reload.claimed? }

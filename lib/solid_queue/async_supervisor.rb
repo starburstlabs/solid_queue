@@ -27,8 +27,7 @@ module SolidQueue
           if (instance = process_instances.delete(thread_id))
             payload[:thread] = instance
 
-            error = Processes::ThreadTerminatedError.new(instance.name)
-            release_claimed_jobs_by(instance, with_error: error)
+            attempt_to_release_claimed_jobs_by(instance, with_error: Processes::ThreadTerminatedError.new(instance.name))
 
             start_process(configured_processes.delete(thread_id))
           end
@@ -39,10 +38,29 @@ module SolidQueue
         process_instances.values.each(&:stop)
 
         Timer.wait_until(SolidQueue.shutdown_timeout, -> { all_processes_terminated? })
+
+        # The exit! that follows skips the shutdown callbacks, so release the jobs
+        # of the threads still running now instead of leaving them to be pruned
+        attempt_to_deregister unless all_processes_terminated?
       end
 
       def perform_immediate_termination
         exit!
+      end
+
+      def attempt_to_deregister
+        wrap_in_app_executor do
+          # Not our own copy: it shares the threads' registrations in memory, and
+          # those of threads that already deregistered are destroyed and frozen
+          if pending_cleanup.empty?
+            SolidQueue::Process.find_by(id: process_id)&.deregister
+          else
+            tracked_names = process_instances.values.map(&:name)
+            SolidQueue::Process.where(supervisor_id: process_id, name: tracked_names).find_each(&:deregister)
+          end
+        end
+      rescue StandardError => error
+        handle_thread_error(error)
       end
 
       def all_processes_terminated?
