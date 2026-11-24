@@ -53,6 +53,24 @@ class SolidQueue::JobTest < ActiveSupport::TestCase
     )
   end
 
+  test "enqueue does not reload the job to create its execution" do
+    job_selects = []
+    callback = ->(*, payload) do
+      # Skip the schema lookups Active Record runs the first time it uses the table
+      job_selects << payload[:sql] if payload[:name] != "SCHEMA" && payload[:sql].match?(/\ASELECT .*solid_queue_jobs/i)
+    end
+
+    ActiveSupport::Notifications.subscribed(callback, "sql.active_record") do
+      AddToBufferJob.perform_later(1)
+      AddToBufferJob.set(wait: 1.minute).perform_later(2)
+      2.times { NonOverlappingJob.perform_later(@result) }
+    end
+
+    assert SolidQueue::BlockedExecution.exists?
+
+    assert_empty job_selects
+  end
+
   test "enqueue active job to be executed right away" do
     active_job = AddToBufferJob.new(1).set(priority: 8, queue: "test")
 
@@ -323,6 +341,21 @@ class SolidQueue::JobTest < ActiveSupport::TestCase
     assert_not not_enqueued.successfully_enqueued?
   end
 
+  test "enqueue jobs in bulk acquiring their concurrency locks by key" do
+    results = 3.times.map { JobResult.create!(queue_name: "default") }
+
+    acquired = []
+    SolidQueue::Semaphore.stubs(:wait).with { |job| acquired << [ job.concurrency_key, job.id ] }.returns(true)
+
+    # Two jobs for each key, with the keys in descending order
+    active_jobs = (results.reverse + results.reverse).map { |result| NonOverlappingJob.new(result) }
+    ActiveJob.perform_all_later(active_jobs)
+
+    # By key and, within a key, in the order they were enqueued
+    assert_equal 6, acquired.size
+    assert_equal acquired.sort, acquired
+  end
+
   test "discard ready job" do
     AddToBufferJob.perform_later(1)
     job = SolidQueue::Job.last
@@ -411,16 +444,16 @@ class SolidQueue::JobTest < ActiveSupport::TestCase
       ActiveJob.perform_all_later(active_jobs)
     end
 
+    assert_job_counts(blocked: -2) do
+      SolidQueue::BlockedExecution.discard_all_from_jobs(SolidQueue::Job.all)
+    end
+
     assert_job_counts(ready: -5) do
       SolidQueue::ReadyExecution.discard_all_from_jobs(SolidQueue::Job.all)
     end
 
     assert_job_counts(scheduled: -2) do
       SolidQueue::ScheduledExecution.discard_all_from_jobs(SolidQueue::Job.all)
-    end
-
-    assert_job_counts(blocked: -2) do
-      SolidQueue::BlockedExecution.discard_all_from_jobs(SolidQueue::Job.all)
     end
   end
 

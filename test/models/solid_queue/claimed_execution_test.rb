@@ -170,7 +170,7 @@ class SolidQueue::ClaimedExecutionTest < ActiveSupport::TestCase
   test "dispatch job with missing class and concurrency key skips concurrency controls" do
     job = create_job_with_missing_class(concurrency_key: "test_key")
 
-    assert_not job.concurrency_limited?
+    assert_nil job.job_class
 
     job.prepare_for_execution
 
@@ -185,6 +185,16 @@ class SolidQueue::ClaimedExecutionTest < ActiveSupport::TestCase
     claimed_execution.perform
 
     assert_equal "provider_job_id: #{job.provider_job_id}", JobBuffer.last_value
+  end
+
+  test "discarding claimed executions in bulk raises UndiscardableError" do
+    assert_raises SolidQueue::Execution::UndiscardableError do
+      SolidQueue::ClaimedExecution.discard_all_in_batches
+    end
+
+    assert_raises SolidQueue::Execution::UndiscardableError do
+      SolidQueue::ClaimedExecution.discard_all_from_jobs([])
+    end
   end
 
   private

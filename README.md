@@ -401,6 +401,8 @@ The supervisor is in charge of managing these processes, and it responds to the 
 
 When receiving a `QUIT` signal, if workers still have jobs in-flight, these will be returned to the queue when the processes are deregistered.
 
+In `async` mode, workers, dispatchers and the scheduler are threads inside the supervisor's process, so they can't be signaled one by one. On `TERM` or `INT`, the supervisor stops them and waits up to `SolidQueue.shutdown_timeout`. If any are still running by then, it deregisters itself, which returns their in-flight jobs to the queue, and exits. On `QUIT`, it exits immediately without deregistering anything, so in-flight jobs remain claimed until another supervisor prunes these processes and marks the jobs as failed with a `SolidQueue::Processes::ProcessPrunedError`.
+
 On Windows, the `QUIT` signal can't be trapped, so the supervisor only responds to `TERM` and `INT` there.
 
 If processes have no chance of cleaning up before exiting (e.g. if someone pulls a cable somewhere), in-flight jobs might remain claimed by the processes executing them. Processes send heartbeats, and the supervisor checks and prunes processes with expired heartbeats. A stale supervised process isn't pruned while its supervisor has a fresh heartbeat, because the supervisor detects actual child exits directly. It becomes eligible for heartbeat-based pruning when its supervisor is also stale. Jobs claimed by a pruned process will be marked as failed with a `SolidQueue::Processes::ProcessPrunedError`. You can configure both the frequency of heartbeats and the threshold to consider a process dead. See the section below for this.
@@ -927,6 +929,8 @@ end
 It's possible to run multiple schedulers with the same `recurring_tasks` configuration, for example, if you have multiple servers for redundancy, and you run the `scheduler` in more than one of them. To avoid enqueuing duplicate tasks at the same time, an entry in a new `solid_queue_recurring_executions` table is created in the same transaction as the job is enqueued. This table has a unique index on `task_key` and `run_at`, ensuring only one entry per task per time will be created. This only works if you have `preserve_finished_jobs` set to `true` (the default), and the guarantee applies as long as you keep the jobs around.
 
 **Note**: a single recurring schedule is supported, so you can have multiple schedulers using the same schedule, but not multiple schedulers using different configurations.
+
+When a scheduler starts, it removes any static recurring tasks that are no longer in its configuration. If you remove all of them, though, no scheduler starts, so the old tasks stay in the `solid_queue_recurring_tasks` table, and in Mission Control, even though nothing runs them. You can delete them from a console with `SolidQueue::RecurringTask.static.delete_all`.
 
 Finally, it's possible to configure jobs that aren't handled by Solid Queue. That is, you can have a job like this in your app:
 ```ruby
