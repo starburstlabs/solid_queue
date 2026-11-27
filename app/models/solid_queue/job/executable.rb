@@ -69,7 +69,8 @@ module SolidQueue
       end
 
       def dispatch
-        if acquire_concurrency_lock then ready
+        if blocked_queue_full? then destroy
+        elsif acquire_concurrency_lock then ready
         else
           handle_concurrency_conflict
         end

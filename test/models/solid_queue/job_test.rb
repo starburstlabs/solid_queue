@@ -165,6 +165,30 @@ class SolidQueue::JobTest < ActiveSupport::TestCase
     end
   end
 
+  test "discard jobs over max_blocked without locking the semaphore" do
+    BoundedBlockedJob.perform_later(@result, name: "ready")
+    BoundedBlockedJob.perform_later(@result, name: "blocked")
+
+    SolidQueue::Semaphore.stubs(:lock).raises("locked the semaphore")
+    assert_job_counts do
+      BoundedBlockedJob.perform_later(@result, name: "discarded")
+    end
+  ensure
+    SolidQueue::Semaphore.unstub(:lock)
+  end
+
+  test "a job over max_blocked takes a slot that's free" do
+    BoundedBlockedJob.perform_later(@result, name: "ready")
+    BoundedBlockedJob.perform_later(@result, name: "blocked")
+
+    # The slot is free, e.g. after its semaphore expired, but the blocked job is still waiting
+    SolidQueue::Semaphore.delete_all
+
+    assert_ready do
+      BoundedBlockedJob.perform_later(@result, name: "takes the free slot")
+    end
+  end
+
   test "max_blocked cap reopens after the blocked job is released" do
     ready_active_job = BoundedBlockedJob.perform_later(@result, name: "ready")
     BoundedBlockedJob.perform_later(@result, name: "blocked-1")
