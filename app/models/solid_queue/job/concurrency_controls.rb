@@ -59,6 +59,23 @@ module SolidQueue
           Semaphore.signal(self)
         end
 
+        # Whether this job would be discarded because its key has no free slot
+        # and already has max_blocked jobs waiting. Checked before taking the
+        # semaphore's lock, so enqueues on a busy key don't wait their turn for
+        # the lock only to be discarded. Both conditions are read in one
+        # statement, so they come from the same moment. Not locking is safe:
+        # a blocked job seen here hasn't started, so it runs after this enqueue.
+        def blocked_queue_full?
+          return false unless concurrency_limited? && concurrency_max_blocked.present? && !concurrency_on_conflict.discard?
+
+          full = Semaphore.where(key: concurrency_key, value: ..0)
+          if concurrency_max_blocked.positive?
+            max_blocked_th = BlockedExecution.where(concurrency_key: concurrency_key).offset(concurrency_max_blocked - 1).limit(1).select(1)
+            full = full.where(max_blocked_th.arel.exists)
+          end
+          full.exists?
+        end
+
         def handle_concurrency_conflict
           if concurrency_on_conflict.discard?
             destroy
