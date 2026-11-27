@@ -22,6 +22,10 @@ class SolidQueue::JobTest < ActiveSupport::TestCase
     limits_concurrency to: 2, key: ->(job_result, **) { job_result }, on_conflict: :block, max_blocked: 2
   end
 
+  class BoundedBlockedOddKeyJob < NonOverlappingJob
+    limits_concurrency key: ->(job_result, **) { "?key :name #{job_result.id}" }, on_conflict: :block, max_blocked: 1
+  end
+
   class DiscardableWithMaxBlockedJob < NonOverlappingJob
     limits_concurrency key: ->(job_result, **) { job_result }, on_conflict: :discard, max_blocked: 5
   end
@@ -175,6 +179,12 @@ class SolidQueue::JobTest < ActiveSupport::TestCase
     end
   ensure
     SolidQueue::Semaphore.unstub(:lock)
+  end
+
+  test "max_blocked works with keys that look like SQL placeholders" do
+    assert_ready { BoundedBlockedOddKeyJob.perform_later(@result, name: "ready") }
+    assert_blocked { BoundedBlockedOddKeyJob.perform_later(@result, name: "blocked") }
+    assert_job_counts { BoundedBlockedOddKeyJob.perform_later(@result, name: "discarded") }
   end
 
   test "a job over max_blocked takes a slot that's free" do

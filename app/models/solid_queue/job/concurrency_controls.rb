@@ -68,9 +68,12 @@ module SolidQueue
         def blocked_queue_full?
           return false unless concurrency_limited? && concurrency_max_blocked.present? && !concurrency_on_conflict.discard?
 
-          blocked = BlockedExecution.where(concurrency_key: concurrency_key).limit(concurrency_max_blocked).select(1)
-          Semaphore.where(key: concurrency_key, value: ..0)
-            .where("(SELECT COUNT(*) FROM (#{blocked.to_sql}) blocked) >= ?", concurrency_max_blocked).exists?
+          full = Semaphore.where(key: concurrency_key, value: ..0)
+          if concurrency_max_blocked.positive?
+            max_blocked_th = BlockedExecution.where(concurrency_key: concurrency_key).offset(concurrency_max_blocked - 1).limit(1).select(1)
+            full = full.where(max_blocked_th.arel.exists)
+          end
+          full.exists?
         end
 
         def handle_concurrency_conflict
